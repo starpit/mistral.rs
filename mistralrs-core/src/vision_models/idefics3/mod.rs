@@ -250,6 +250,7 @@ impl Idefics3Model {
             context_lens,
             metadata,
             flash_params,
+            None, // no PIC context for vision models
         )
     }
 }

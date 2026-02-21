@@ -66,6 +66,7 @@ pub mod matformer;
 mod mla;
 mod models;
 mod paged_attention;
+pub mod pic;
 mod pipeline;
 mod prefix_cacher;
 mod request;

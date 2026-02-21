@@ -53,6 +53,7 @@ pub mod text_models_inputs_processor {
 
     use anyhow::Result;
     use candle_core::{DType, Device, DeviceLocation, Tensor, WithDType};
+    pub use crate::pic::PicContext;
     use tokenizers::Tokenizer;
 
     use crate::{
@@ -904,6 +905,9 @@ pub mod text_models_inputs_processor {
         pub paged_attn_meta: Option<PagedAttentionInputMetadata>,
         pub flash_meta: FlashParams,
         pub flash_meta_full: Option<FlashParams>,
+        /// Position-independent caching context for spnl Plus blocks.
+        /// When present, models should use deferred RoPE and block attention masking.
+        pub pic_context: Option<PicContext>,
     }
 
     pub struct TextInputsProcessor;
@@ -983,6 +987,7 @@ pub mod text_models_inputs_processor {
                     paged_attn_meta,
                     flash_meta,
                     flash_meta_full: Some(flash_meta_full),
+                    pic_context: None,
                 });
                 Ok(InputProcessorOutput {
                     inputs,
@@ -1023,6 +1028,7 @@ pub mod text_models_inputs_processor {
                     paged_attn_meta,
                     flash_meta: flash_meta.clone(),
                     flash_meta_full: Some(flash_meta),
+                    pic_context: None,
                 });
                 Ok(InputProcessorOutput {
                     inputs,
@@ -1063,6 +1069,7 @@ pub mod text_models_inputs_processor {
                     paged_attn_meta,
                     flash_meta,
                     flash_meta_full: None,
+                    pic_context: None,
                 });
                 Ok(InputProcessorOutput {
                     inputs,
@@ -1104,6 +1111,7 @@ pub mod text_models_inputs_processor {
                     paged_attn_meta,
                     flash_meta,
                     flash_meta_full: None,
+                    pic_context: None,
                 });
                 Ok(InputProcessorOutput {
                     inputs,

@@ -12,6 +12,7 @@ use crate::{
     device_map::DeviceMapper,
     lora::{LoraConfig, Ordering},
     paged_attention::{AttentionImplementation, ModelConfigLike, ModelConfigMetadata},
+    pic::PicContext,
     pipeline::{
         isq::IsqModelLoader,
         text_models_inputs_processor::{FlashParams, PagedAttentionInputMetadata},
@@ -64,6 +65,33 @@ pub trait NormalModel: IsqModel + AnyMoeBaseModelMixin {
         flash_params: &FlashParams,
         flash_params_full: &FlashParams,
     ) -> candle_core::Result<Tensor>;
+    /// Forward pass with PIC (Position-Independent Caching) context.
+    ///
+    /// Models that support PIC should override this method. The default
+    /// implementation ignores the PIC context and falls back to the standard forward.
+    #[allow(clippy::too_many_arguments)]
+    fn forward_pic(
+        &self,
+        input_ids: &Tensor,
+        seqlen_offsets: &[usize],
+        context_lens: Vec<(usize, usize)>,
+        position_ids: Vec<usize>,
+        metadata: Option<(Vec<(Tensor, Tensor)>, &PagedAttentionInputMetadata)>,
+        flash_params: &FlashParams,
+        pic_context: Option<&PicContext>,
+    ) -> candle_core::Result<Tensor> {
+        // Default: ignore PIC context, use standard forward
+        let _ = pic_context;
+        self.forward(
+            input_ids,
+            seqlen_offsets,
+            context_lens,
+            position_ids,
+            metadata,
+            flash_params,
+        )
+    }
+
     fn is_xlora(&self) -> bool;
     fn device(&self) -> &Device;
     fn cache(&self) -> &EitherCache;

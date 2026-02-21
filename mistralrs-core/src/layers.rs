@@ -1028,6 +1028,28 @@ impl Llama3RotaryEmbedding {
     ) -> Result<(Tensor, Tensor)> {
         self.0.forward(q, k, seqlen_offsets)
     }
+
+    /// Apply RoPE to Q and K using per-token position IDs.
+    ///
+    /// Unlike `forward` which uses a single offset per batch element,
+    /// this method allows specifying individual positions for each token.
+    /// This is needed for PIC (Position-Independent Caching) where different
+    /// tokens in the same sequence may have non-contiguous positions.
+    ///
+    /// `q`: shape (1, n_heads, q_seq_len, head_dim)
+    /// `k`: shape (1, n_kv_heads, k_seq_len, head_dim)
+    /// `q_positions`: position IDs for each Q token, length = q_seq_len
+    /// `k_positions`: position IDs for each K token, length = k_seq_len
+    pub fn forward_per_token(
+        &self,
+        q: &Tensor,
+        k: &Tensor,
+        q_positions: &[usize],
+        k_positions: &[usize],
+    ) -> Result<(Tensor, Tensor)> {
+        self.0
+            .forward_per_token(q, k, q_positions, k_positions)
+    }
 }
 
 /// RoPE for SmolLm3
@@ -2309,6 +2331,53 @@ impl RotaryEmbedding {
             }
             Ok((Tensor::cat(&q_embeds, 0)?, Tensor::cat(&k_embeds, 0)?))
         }
+    }
+
+    /// Apply RoPE with per-token position IDs (for PIC deferred RoPE).
+    ///
+    /// Each token gets its own position for sin/cos lookup, enabling
+    /// non-contiguous position assignments needed by position-independent caching.
+    ///
+    /// Batch size must be 1 for this method.
+    pub fn forward_per_token(
+        &self,
+        q: &Tensor,
+        k: &Tensor,
+        q_positions: &[usize],
+        k_positions: &[usize],
+    ) -> Result<(Tensor, Tensor)> {
+        let rope = if self.is_gpt_neox {
+            candle_nn::rotary_emb::rope
+        } else {
+            candle_nn::rotary_emb::rope_i
+        };
+
+        // Gather cos/sin for Q positions
+        let q_cos = self.gather_positions(&self.cos, q_positions)?;
+        let q_sin = self.gather_positions(&self.sin, q_positions)?;
+
+        // Gather cos/sin for K positions
+        let k_cos = self.gather_positions(&self.cos, k_positions)?;
+        let k_sin = self.gather_positions(&self.sin, k_positions)?;
+
+        let q_embed = rope(&q.contiguous()?, &q_cos, &q_sin)?;
+        let k_embed = rope(&k.contiguous()?, &k_cos, &k_sin)?;
+
+        Ok((q_embed, k_embed))
+    }
+
+    /// Gather sin/cos values for the given position IDs.
+    /// Input table: shape (max_pos, head_dim/2)
+    /// Returns: shape (len(positions), head_dim/2)
+    fn gather_positions(&self, table: &Tensor, positions: &[usize]) -> Result<Tensor> {
+        if positions.is_empty() {
+            return Tensor::zeros((0, table.dim(1)?), table.dtype(), table.device());
+        }
+        let indices: Vec<Tensor> = positions
+            .iter()
+            .map(|&pos| table.narrow(0, pos, 1))
+            .collect::<Result<Vec<_>>>()?;
+        Tensor::cat(&indices, 0)
     }
 }
 

@@ -1,3 +1,4 @@
+use std::hash::{DefaultHasher, Hash, Hasher};
 use candle_core::{Device, Result};
 use indexmap::IndexMap;
 use itertools::Itertools;
@@ -263,5 +264,55 @@ impl PrefixCacheManagerV2 {
         }
 
         Ok(None)
+    }
+
+    /// Search for a cached PIC (Plus) block by content hash.
+    ///
+    /// Unlike `search_for_matching_cache` which matches by prefix position,
+    /// this matches by content hash alone, enabling position-independent reuse.
+    /// Returns the cached KV entries for the block if found.
+    pub fn search_for_pic_block(
+        &self,
+        block_tokens: &[u32],
+        content_hash: u64,
+    ) -> Result<Option<Vec<Option<KvCache>>>> {
+        if self.no_prefix_cache || block_tokens.is_empty() {
+            return Ok(None);
+        }
+
+        // Look for a cached entry with matching content hash
+        // The content hash is computed by the caller and identifies the block's content
+        for (k, v) in &self.caches {
+            // Compute content hash of the cached token sequence
+            let mut hasher = DefaultHasher::new();
+            k.0.hash(&mut hasher);
+            let cached_hash = hasher.finish();
+
+            if cached_hash == content_hash && k.0 == block_tokens {
+                return Ok(Some(v.cache.clone()));
+            }
+        }
+
+        Ok(None)
+    }
+
+    /// Add a PIC block's KV cache to the content-based cache.
+    pub fn add_pic_block(
+        &mut self,
+        block_tokens: Vec<u32>,
+        cache: Vec<Option<KvCache>>,
+    ) {
+        if self.no_prefix_cache {
+            return;
+        }
+
+        self.caches.insert(
+            block_tokens.into(),
+            CacheElement {
+                cache,
+                image_hashes: None,
+                audio_hashes: None,
+            },
+        );
     }
 }

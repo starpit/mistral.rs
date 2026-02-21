@@ -1159,6 +1159,7 @@ impl Pipeline for NormalPipeline {
             paged_attn_meta,
             flash_meta,
             flash_meta_full,
+            pic_context,
         } = *inputs.downcast().expect("Downcast failed.");
         let metadata = self.get_metadata();
         let paged_attn_meta = match (&metadata.cache_engine, &paged_attn_meta) {
@@ -1179,13 +1180,14 @@ impl Pipeline for NormalPipeline {
                     .as_ref()
                     .map(|meta| (meta.0.get_kv_cache().clone(), meta.1.clone()));
 
-                self.model.forward(
+                self.model.forward_pic(
                     &input_ids,
                     &seqlen_offsets,
                     context_lens,
                     position_ids,
                     paged_attn_meta.as_ref().map(|(a, b)| (a.clone(), b)),
                     &flash_meta,
+                    pic_context.as_ref(),
                 )?
             }
             true => self.model.xlora_forward(

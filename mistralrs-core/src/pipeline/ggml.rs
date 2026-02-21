@@ -537,6 +537,7 @@ impl Pipeline for GGMLPipeline {
             paged_attn_meta: _, // NOTE(EricLBuehler): ignore it for ggml
             flash_meta,         // NOTE(EricLBuehler): ignore it for ggml dequant into f32
             flash_meta_full,    // NOTE(EricLBuehler): ignore it for ggml dequant into f32
+            pic_context: _pic_context,
         } = *inputs.downcast().expect("Downcast failed.");
         let logits = match self.model {
             Model::Llama(ref model) => {

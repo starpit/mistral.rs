@@ -334,6 +334,9 @@ pub use mistralrs_core::{initialize_logging, paged_attn_supported, parse_isq_val
 // ========== llguidance ==========
 pub use mistralrs_core::llguidance;
 
+// Position-Independent Caching (PIC) types for spnl Plus support
+pub use mistralrs_core::pic;
+
 // Re-export the tool proc macro for ergonomic tool definition
 pub use mistralrs_macros::tool;
 
