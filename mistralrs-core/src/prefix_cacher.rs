@@ -35,6 +35,8 @@ struct CacheElement {
 
 pub struct PrefixCacheManagerV2 {
     caches: IndexMap<Tokens, CacheElement>,
+    /// PIC block cache keyed by text content hash (position-independent).
+    pic_blocks: IndexMap<u64, CacheElement>,
     n_on_device: usize,
     no_prefix_cache: bool,
     has_paged_attention: bool,
@@ -58,6 +60,7 @@ impl PrefixCacheManagerV2 {
         }
         PrefixCacheManagerV2 {
             caches: IndexMap::new(),
+            pic_blocks: IndexMap::new(),
             n_on_device,
             no_prefix_cache,
             has_paged_attention,
@@ -266,48 +269,43 @@ impl PrefixCacheManagerV2 {
         Ok(None)
     }
 
-    /// Search for a cached PIC (Plus) block by content hash.
+    /// Search for a cached PIC (Plus) block by text content hash.
     ///
     /// Unlike `search_for_matching_cache` which matches by prefix position,
-    /// this matches by content hash alone, enabling position-independent reuse.
-    /// Returns the cached KV entries for the block if found.
+    /// this matches by text content hash alone, enabling position-independent reuse.
+    /// The hash should be computed via `pic::content_hash_text()` from the original
+    /// message text — NOT from token IDs (which are position-dependent due to BPE).
     pub fn search_for_pic_block(
         &self,
-        block_tokens: &[u32],
+        _block_tokens: &[u32],
         content_hash: u64,
     ) -> Result<Option<Vec<Option<KvCache>>>> {
-        if self.no_prefix_cache || block_tokens.is_empty() {
+        if self.no_prefix_cache {
             return Ok(None);
         }
 
-        // Look for a cached entry with matching content hash
-        // The content hash is computed by the caller and identifies the block's content
-        for (k, v) in &self.caches {
-            // Compute content hash of the cached token sequence
-            let mut hasher = DefaultHasher::new();
-            k.0.hash(&mut hasher);
-            let cached_hash = hasher.finish();
-
-            if cached_hash == content_hash && k.0 == block_tokens {
-                return Ok(Some(v.cache.clone()));
-            }
+        if let Some(entry) = self.pic_blocks.get(&content_hash) {
+            return Ok(Some(entry.cache.clone()));
         }
 
         Ok(None)
     }
 
-    /// Add a PIC block's KV cache to the content-based cache.
+    /// Add a PIC block's KV cache keyed by text content hash.
+    ///
+    /// The `content_hash` should be computed via `pic::content_hash_text()` from
+    /// the original message text.
     pub fn add_pic_block(
         &mut self,
-        block_tokens: Vec<u32>,
+        content_hash: u64,
         cache: Vec<Option<KvCache>>,
     ) {
         if self.no_prefix_cache {
             return;
         }
 
-        self.caches.insert(
-            block_tokens.into(),
+        self.pic_blocks.insert(
+            content_hash,
             CacheElement {
                 cache,
                 image_hashes: None,

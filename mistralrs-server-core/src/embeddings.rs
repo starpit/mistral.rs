@@ -262,6 +262,7 @@ async fn fetch_embedding(
         web_search_options: None,
         model_id: model_id.map(|m| m.to_string()),
         truncate_sequence,
+        pic_context: None,
     }));
 
     send_request_with_model(&state, request, model_id)
@@ -295,6 +296,7 @@ async fn fetch_embedding_tokens(
         web_search_options: None,
         model_id: model_id.map(|m| m.to_string()),
         truncate_sequence,
+        pic_context: None,
     }));
 
     send_request_with_model(&state, request, model_id)

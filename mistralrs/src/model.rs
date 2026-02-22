@@ -144,6 +144,7 @@ impl Model {
             web_search_options: request.take_web_search_options(),
             model_id: model_id.map(|s| s.to_string()),
             truncate_sequence,
+            pic_context: None,
         }));
 
         self.runner.get_sender(model_id)?.send(request).await?;
@@ -195,6 +196,7 @@ impl Model {
             web_search_options: request.take_web_search_options(),
             model_id: model_id.map(|s| s.to_string()),
             truncate_sequence,
+            pic_context: None,
         }));
 
         self.runner.get_sender(model_id)?.send(request).await?;
@@ -255,6 +257,7 @@ impl Model {
             web_search_options: request.take_web_search_options(),
             model_id: model_id.map(|s| s.to_string()),
             truncate_sequence,
+            pic_context: None,
         }));
 
         self.runner.get_sender(model_id)?.send(request).await?;
@@ -411,6 +414,7 @@ impl Model {
             web_search_options: None,
             model_id: model_id.map(|s| s.to_string()),
             truncate_sequence: false,
+            pic_context: None,
         }));
 
         self.runner.get_sender(model_id)?.send(request).await?;
@@ -472,6 +476,7 @@ impl Model {
             web_search_options: None,
             model_id: model_id.map(|s| s.to_string()),
             truncate_sequence: false,
+            pic_context: None,
         }));
 
         self.runner.get_sender(model_id)?.send(request).await?;
@@ -546,6 +551,7 @@ impl Model {
                     web_search_options: None,
                     model_id: model_id_owned.clone(),
                     truncate_sequence,
+                    pic_context: None,
                 }));
 
                 runner

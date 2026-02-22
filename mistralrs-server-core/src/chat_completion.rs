@@ -594,6 +594,7 @@ pub async fn parse_request(
                 Some(oairequest.model.clone())
             },
             truncate_sequence: oairequest.truncate_sequence.unwrap_or(false),
+            pic_context: None,
         })),
         is_streaming,
     ))

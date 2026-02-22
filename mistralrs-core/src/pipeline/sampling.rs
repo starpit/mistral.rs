@@ -212,6 +212,27 @@ pub(crate) async fn finish_or_add_toks_to_seq(
         // to ensure sequence completes even when tool detection thinks output might be a tool call
         if let Some(reason) = is_done {
             if use_prefix_cacher {
+                // Save individual Plus blocks for PIC content-based lookup.
+                // Clone pic_context first to avoid borrow conflicts with seq.
+                let pic_blocks = seq.pic_context().map(|ctx| ctx.blocks.clone());
+                if let Some(blocks) = pic_blocks {
+                    for block in &blocks {
+                        if block.is_plus {
+                            if let Some(hash) = block.content_hash {
+                                let block_cache: Vec<Option<crate::pipeline::KvCache>> = seq
+                                    .normal_cache()
+                                    .iter()
+                                    .map(|layer| {
+                                        layer.as_ref().and_then(|kv| {
+                                            kv.narrow_range(block.start, block.len).ok()
+                                        })
+                                    })
+                                    .collect();
+                                prefix_cacher.add_pic_block(hash, block_cache);
+                            }
+                        }
+                    }
+                }
                 prefix_cacher.add_sequence(seq);
                 prefix_cacher.evict_caches()?;
             }

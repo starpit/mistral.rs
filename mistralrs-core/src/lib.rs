@@ -805,6 +805,7 @@ impl MistralRs {
                     web_search_options: None,
                     model_id: None,
                     truncate_sequence: false,
+                    pic_context: None,
                 }));
                 info!("Beginning dummy run.");
                 let start = Instant::now();

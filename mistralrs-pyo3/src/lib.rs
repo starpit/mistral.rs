@@ -1245,6 +1245,7 @@ impl Runner {
                 web_search_options: request.web_search_options.clone(),
                 model_id: model_id.clone(),
                 truncate_sequence: request.truncate_sequence,
+                pic_context: None,
             }));
 
             let is_streaming = request.stream;
@@ -1351,6 +1352,7 @@ impl Runner {
                         web_search_options: None,
                         model_id: model_id.clone(),
                         truncate_sequence,
+                        pic_context: None,
                     }));
 
                     sender
@@ -1484,6 +1486,7 @@ impl Runner {
                 web_search_options: None,
                 model_id: model_id.clone(),
                 truncate_sequence: request.truncate_sequence,
+                pic_context: None,
             }));
 
             let debug_repr = format!("{request:?}");
@@ -1564,6 +1567,7 @@ impl Runner {
             web_search_options: None,
             model_id: model_id.clone(),
             truncate_sequence: false,
+            pic_context: None,
         }));
 
         let runner = self.runner.clone();
@@ -1614,6 +1618,7 @@ impl Runner {
             web_search_options: None,
             model_id: model_id.clone(),
             truncate_sequence: false,
+            pic_context: None,
         }));
 
         let runner = self.runner.clone();
@@ -2052,6 +2057,7 @@ impl Runner {
                 web_search_options: request.web_search_options.clone(),
                 model_id: Some(model_id.clone()),
                 truncate_sequence: request.truncate_sequence,
+                pic_context: None,
             }));
 
             let is_streaming = request.stream;
@@ -2182,6 +2188,7 @@ impl Runner {
                 web_search_options: None,
                 model_id: Some(model_id.clone()),
                 truncate_sequence: request.truncate_sequence,
+                pic_context: None,
             }));
 
             let debug_repr = format!("{request:?}");

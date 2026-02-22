@@ -231,6 +231,7 @@ async fn run_single_bench(
         web_search_options: None,
         model_id: None,
         truncate_sequence: false,
+        pic_context: None,
     }));
 
     sender.send(req).await?;

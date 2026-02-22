@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::{
+    pic::PicContext,
     response::Response, sampler::SamplingParams, tools::ToolChoice, CustomLogitsProcessor,
     DiffusionGenerationParams, Tool,
 };
@@ -194,6 +195,9 @@ pub struct NormalRequest {
     pub model_id: Option<String>,
     #[serde(default)]
     pub truncate_sequence: bool,
+    /// PIC context for position-independent caching of Plus blocks.
+    #[serde(skip)]
+    pub pic_context: Option<PicContext>,
 }
 
 impl NormalRequest {
@@ -221,6 +225,7 @@ impl NormalRequest {
             web_search_options: None,
             model_id: None,
             truncate_sequence: false,
+            pic_context: None,
         }
     }
 }

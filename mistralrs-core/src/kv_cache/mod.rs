@@ -162,6 +162,46 @@ impl KvCache {
     pub fn is_rotating(&self) -> bool {
         matches!(self, Self::Rotating { .. })
     }
+
+    /// Extract a sub-range of the KV cache along the sequence dimension.
+    ///
+    /// Returns a new `KvCache` containing only the tokens in `[start..start+len)`.
+    /// Only supported for Normal (non-rotating) caches.
+    pub fn narrow_range(&self, start: usize, len: usize) -> candle_core::Result<Self> {
+        match self {
+            Self::Normal { k, v } => {
+                let k_data = k
+                    .all_data
+                    .as_ref()
+                    .ok_or_else(|| candle_core::Error::Msg("no k cache data".into()))?
+                    .narrow(k.dim, start, len)?;
+                let v_data = v
+                    .all_data
+                    .as_ref()
+                    .ok_or_else(|| candle_core::Error::Msg("no v cache data".into()))?
+                    .narrow(v.dim, start, len)?;
+                Ok(Self::Normal {
+                    k: SingleCache {
+                        all_data: Some(k_data),
+                        dim: k.dim,
+                        current_seq_len: len,
+                        max_seq_len: k.max_seq_len,
+                        capacity_seq_len: len,
+                    },
+                    v: SingleCache {
+                        all_data: Some(v_data),
+                        dim: v.dim,
+                        current_seq_len: len,
+                        max_seq_len: v.max_seq_len,
+                        capacity_seq_len: len,
+                    },
+                })
+            }
+            Self::Rotating { .. } => {
+                candle_core::bail!("narrow_range not supported for rotating cache")
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone)]

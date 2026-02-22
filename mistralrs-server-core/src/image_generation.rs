@@ -91,6 +91,7 @@ pub fn parse_request(
             Some(oairequest.model.clone())
         },
         truncate_sequence: false,
+        pic_context: None,
     })))
 }
 

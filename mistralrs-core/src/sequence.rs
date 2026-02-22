@@ -2,6 +2,7 @@ use crate::{
     get_mut_arcmutex, get_mut_group,
     harmony::HarmonyContext,
     paged_attention::block_hash::MultiModalFeature,
+    pic::PicContext,
     pipeline::{text_models_inputs_processor::PagedAttentionMeta, LayerCaches},
     response::{ChatCompletionChunkResponse, Choice, ChunkChoice, Response, SYSTEM_FINGERPRINT},
     sampler::{Logprobs, Sampler},
@@ -417,6 +418,7 @@ pub struct Sequence {
     sequence_stepping_type: SeqStepType,
     pub(crate) return_raw_logits: bool,
     token_offset: usize,
+    pic_context: Option<PicContext>,
     eos_tokens: Vec<u32>,
 
     // Multimodal data (images, diffusion settings, pixel caches)
@@ -573,6 +575,7 @@ impl Sequence {
             sequence_stepping_type,
             return_raw_logits,
             token_offset: 0,
+            pic_context: None,
             eos_tokens,
             total_prompt_time: None,
             step_start_instant: None,
@@ -610,6 +613,32 @@ impl Sequence {
         self.set_state(SequenceState::RunningPrefillPrompt);
         self.token_offset = offset;
         self
+    }
+
+    /// Set up a sequence for PIC-accelerated prefill.
+    ///
+    /// Pre-loads the cached Plus block KV entries into the sequence's normal cache,
+    /// sets the PIC context for deferred RoPE, and configures the remaining tokens
+    /// (cross tokens) for prefill.
+    pub fn prefill_v2_pic(
+        mut self,
+        cache: Vec<Option<KvCache>>,
+        pic_context: PicContext,
+        remaining_toks: Vec<u32>,
+    ) -> Self {
+        self.normal_cache = cache;
+        self.pic_context = Some(pic_context);
+        self.prefill_prompt_toks = Some(remaining_toks);
+        self.set_state(SequenceState::RunningPrefillPrompt);
+        self
+    }
+
+    pub fn pic_context(&self) -> Option<&PicContext> {
+        self.pic_context.as_ref()
+    }
+
+    pub fn set_pic_context(&mut self, ctx: PicContext) {
+        self.pic_context = Some(ctx);
     }
 
     /// This is the number of tokens. If the KV cache is Some, then it will use that.

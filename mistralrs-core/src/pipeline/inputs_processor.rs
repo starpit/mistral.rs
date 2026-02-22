@@ -1028,7 +1028,7 @@ pub mod text_models_inputs_processor {
                     paged_attn_meta,
                     flash_meta: flash_meta.clone(),
                     flash_meta_full: Some(flash_meta),
-                    pic_context: None,
+                    pic_context: input_seqs.first().and_then(|seq| seq.pic_context().cloned()),
                 });
                 Ok(InputProcessorOutput {
                     inputs,
@@ -1069,7 +1069,7 @@ pub mod text_models_inputs_processor {
                     paged_attn_meta,
                     flash_meta,
                     flash_meta_full: None,
-                    pic_context: None,
+                    pic_context: input_seqs.first().and_then(|seq| seq.pic_context().cloned()),
                 });
                 Ok(InputProcessorOutput {
                     inputs,

@@ -1,4 +1,5 @@
 use crate::{
+    pic,
     pipeline::NormalCache,
     prefix_cacher::MatchingCache,
     request::{DetokenizationRequest, NormalRequest, TokenizationRequest},
@@ -24,6 +25,16 @@ use crate::{
 };
 
 use super::{search_request, Engine, TERMINATE_ALL_NEXT_STEP};
+
+/// Find the first occurrence of `needle` in `haystack`. Returns the starting index.
+fn find_subsequence(haystack: &[u32], needle: &[u32]) -> Option<usize> {
+    if needle.is_empty() || needle.len() > haystack.len() {
+        return None;
+    }
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
+}
 
 impl Engine {
     pub async fn handle_request(self: Arc<Self>, request: Request) {
@@ -57,7 +68,7 @@ impl Engine {
         }
     }
 
-    pub(super) async fn add_request(&self, request: NormalRequest) {
+    pub(super) async fn add_request(&self, mut request: NormalRequest) {
         let is_chat = matches!(
             request.messages,
             RequestMessage::Chat { .. } | RequestMessage::VisionChat { .. }
@@ -167,6 +178,58 @@ impl Engine {
             _ => None,
         };
         let mut added_seq = false;
+
+        // Extract PIC Plus/Cross flags from message content markers.
+        // Messages tagged with "\x00PIC_PLUS\x00" prefix are Plus blocks.
+        // We strip the marker and record which messages are Plus.
+        const PIC_PLUS_MARKER: &str = "\x00PIC_PLUS\x00";
+        let mut pic_message_flags: Option<Vec<bool>> = None;
+
+        if let RequestMessage::Chat { ref mut messages, .. }
+            | RequestMessage::VisionChat { ref mut messages, .. } = request.messages
+        {
+            let mut flags = Vec::new();
+            let mut has_any_plus = false;
+            for msg in messages.iter_mut() {
+                if let Some(content) = msg.get_mut("content") {
+                    if let either::Either::Left(ref mut text) = content {
+                        if let Some(stripped) = text.strip_prefix(PIC_PLUS_MARKER) {
+                            *text = stripped.to_string();
+                            flags.push(true);
+                            has_any_plus = true;
+                            continue;
+                        }
+                    }
+                }
+                flags.push(false);
+            }
+            if has_any_plus {
+                pic_message_flags = Some(flags);
+            }
+        }
+
+        // Keep a clone of message contents if we need to compute PIC token boundaries later.
+        let pic_message_contents: Option<Vec<(String, bool)>> = pic_message_flags
+            .as_ref()
+            .map(|flags| {
+                if let RequestMessage::Chat { ref messages, .. }
+                    | RequestMessage::VisionChat { ref messages, .. } = request.messages
+                {
+                    messages
+                        .iter()
+                        .zip(flags.iter())
+                        .map(|(msg, &is_plus)| {
+                            let text = msg
+                                .get("content")
+                                .and_then(|c| c.as_ref().left().cloned())
+                                .unwrap_or_default();
+                            (text, is_plus)
+                        })
+                        .collect()
+                } else {
+                    Vec::new()
+                }
+            });
 
         let (mut prompt_tokens, prompt_text) = match request.messages {
             RequestMessage::Chat {
@@ -624,30 +687,250 @@ impl Engine {
                 );
             }
 
-            let prefill_cache = handle_seq_error!(
-                get_mut_arcmutex!(self.prefix_cacher).search_for_matching_cache(
-                    seq.get_toks(),
-                    seq.image_hashes(),
-                    seq.audio_hashes(),
-                ),
-                request.response
-            );
-
-            seq = match prefill_cache.clone() {
-                Some(MatchingCache::Normal {
-                    normal,
-                    images_to_keep,
-                    audios_to_keep,
-                    toks,
-                    offset,
-                }) => {
-                    self.logger.add_prefix_cache_hit();
-
-                    seq.keep_num_images(images_to_keep);
-                    seq.keep_num_audios(audios_to_keep);
-                    seq.prefill_v2_normal(normal, toks, offset)
+            // Build PicContext from in-band message flags if present.
+            // This finds each Plus message's content in the rendered prompt text,
+            // maps text byte positions to token positions via tokenizer offsets,
+            // and constructs PicBlock entries with content hashes.
+            let pic_ctx_from_messages: Option<pic::PicContext> = (|| {
+                let contents = pic_message_contents.as_ref()?;
+                if contents.is_empty() || !contents.iter().any(|(_, is_plus)| *is_plus) {
+                    return None;
                 }
-                None => seq,
+
+                let pipeline = get_mut_arcmutex!(self.pipeline);
+                let tokenizer = pipeline.tokenizer()?;
+                let all_toks = seq.get_toks();
+
+                // For each message, tokenize its content individually (without special tokens)
+                // and find the token subsequence in the full sequence.
+                // Search forward from the end of the previous match.
+                let mut blocks = Vec::new();
+                let mut search_from_tok = 0usize;
+
+                for (content, is_plus) in contents {
+                    if content.is_empty() {
+                        continue;
+                    }
+
+                    // Tokenize this message's content as a plain string (no special tokens).
+                    let content_encoding = tokenizer
+                        .encode_fast(content.clone(), false)
+                        .ok()?;
+                    let content_toks = content_encoding.get_ids();
+                    if content_toks.is_empty() {
+                        continue;
+                    }
+
+                    // Find a matching subsequence in the full token array.
+                    // Skip the first token (may differ due to BPE boundary) and search
+                    // for the interior tokens to find the approximate position.
+                    let found_pos = if content_toks.len() >= 3 {
+                        // Search for interior tokens (skip first and last which may have boundary effects)
+                        let interior = &content_toks[1..content_toks.len() - 1];
+                        find_subsequence(&all_toks[search_from_tok..], interior)
+                            .map(|pos| search_from_tok + pos - 1) // -1 to include the first token
+                    } else {
+                        // Short content: search for exact match
+                        find_subsequence(&all_toks[search_from_tok..], content_toks)
+                            .map(|pos| search_from_tok + pos)
+                    };
+
+                    let tok_start = found_pos?;
+                    let tok_len = content_toks.len();
+
+                    // Clamp to the available token range
+                    let tok_len = tok_len.min(all_toks.len().saturating_sub(tok_start));
+                    if tok_len == 0 {
+                        continue;
+                    }
+
+                    search_from_tok = tok_start + tok_len;
+
+                    let content_hash = if *is_plus {
+                        Some(pic::content_hash_text(content))
+                    } else {
+                        None
+                    };
+
+                    blocks.push(pic::PicBlock {
+                        start: tok_start,
+                        len: tok_len,
+                        is_plus: *is_plus,
+                        content_hash,
+                    });
+                }
+
+                if blocks.iter().any(|b| b.is_plus) {
+                    Some(pic::PicContext::new(blocks))
+                } else {
+                    None
+                }
+            })();
+
+            // Attach PicContext to the sequence if we built one from message flags
+            if let Some(ref pic_ctx) = pic_ctx_from_messages {
+                seq.set_pic_context(pic_ctx.clone());
+            }
+
+            // Resolve PIC blocks from all possible sources.
+            // This must happen before prefix cache lookup because PIC lookup
+            // should take priority when PIC blocks are present (normal prefix
+            // caching can only match the shared prefix, while PIC matches
+            // individual content blocks regardless of position).
+            let pic_blocks: Option<Vec<pic::PicBlock>> = if let Some(ref ctx) =
+                pic_ctx_from_messages
+            {
+                Some(ctx.blocks.clone())
+            } else if let (Some(plus_tok), Some(cross_tok)) =
+                (pic::pic_plus_token(), pic::pic_cross_token())
+            {
+                pic::detect_pic_blocks(seq.get_toks(), plus_tok, cross_tok)
+            } else if let Some(ctx) = request.pic_context.take() {
+                let blocks = ctx.blocks.clone();
+                seq.set_pic_context(ctx);
+                Some(blocks)
+            } else {
+                None
+            };
+
+            // Try PIC block-level cache lookup first when Plus blocks are present.
+            let has_plus_blocks = pic_blocks
+                .as_ref()
+                .is_some_and(|blocks| blocks.iter().any(|b| b.is_plus));
+
+            seq = if has_plus_blocks {
+                let pic_blocks = pic_blocks.unwrap();
+                let cacher = get_mut_arcmutex!(self.prefix_cacher);
+                let mut all_hit = true;
+                let mut block_caches = Vec::new();
+
+                for block in &pic_blocks {
+                    if block.is_plus {
+                        if let Some(hash) = block.content_hash {
+                            let toks = &seq.get_toks()[block.start..block.start + block.len];
+                            match cacher.search_for_pic_block(toks, hash) {
+                                Ok(Some(cache)) => {
+                                    block_caches.push((block.clone(), cache));
+                                }
+                                _ => {
+                                    all_hit = false;
+                                    break;
+                                }
+                            }
+                        } else {
+                            all_hit = false;
+                            break;
+                        }
+                    }
+                }
+
+                if all_hit && !block_caches.is_empty() {
+                    pic::record_cache_hit();
+                    tracing::info!(
+                        "PIC cache hit: {} Plus blocks reused",
+                        block_caches.len()
+                    );
+
+                    let num_layers = block_caches[0].1.len();
+                    let mut composite_cache: Vec<Option<crate::pipeline::KvCache>> =
+                        vec![None; num_layers];
+
+                    for layer_idx in 0..num_layers {
+                        let mut layer_k_parts = Vec::new();
+                        let mut layer_v_parts = Vec::new();
+                        let mut any_data = false;
+
+                        for (_, block_cache) in &block_caches {
+                            if let Some(Some(kv)) = block_cache.get(layer_idx) {
+                                if let (Ok(Some(k)), Ok(Some(v))) = (kv.k(), kv.v()) {
+                                    layer_k_parts.push(k);
+                                    layer_v_parts.push(v);
+                                    any_data = true;
+                                }
+                            }
+                        }
+
+                        if any_data && !layer_k_parts.is_empty() {
+                            let cat_k = if layer_k_parts.len() > 1 {
+                                candle_core::Tensor::cat(&layer_k_parts, 2)
+                            } else {
+                                Ok(layer_k_parts[0].clone())
+                            };
+                            let cat_v = if layer_v_parts.len() > 1 {
+                                candle_core::Tensor::cat(&layer_v_parts, 2)
+                            } else {
+                                Ok(layer_v_parts[0].clone())
+                            };
+
+                            if let (Ok(k), Ok(v)) = (cat_k, cat_v) {
+                                let total_len = k.dim(2).unwrap_or(0);
+                                composite_cache[layer_idx] =
+                                    Some(crate::pipeline::KvCache::Normal {
+                                        k: crate::kv_cache::SingleCache {
+                                            all_data: Some(k),
+                                            dim: 2,
+                                            current_seq_len: total_len,
+                                            max_seq_len: usize::MAX,
+                                            capacity_seq_len: total_len,
+                                        },
+                                        v: crate::kv_cache::SingleCache {
+                                            all_data: Some(v),
+                                            dim: 2,
+                                            current_seq_len: total_len,
+                                            max_seq_len: usize::MAX,
+                                            capacity_seq_len: total_len,
+                                        },
+                                    });
+                            }
+                        }
+                    }
+
+                    let pic_ctx = pic::PicContext::new(pic_blocks);
+                    let remaining_toks: Vec<u32> = seq
+                        .get_toks()
+                        .iter()
+                        .enumerate()
+                        .filter(|(idx, _)| !pic_ctx.is_plus_token(*idx))
+                        .map(|(_, &t)| t)
+                        .collect();
+
+                    self.logger.add_prefix_cache_hit();
+                    seq.prefill_v2_pic(composite_cache, pic_ctx, remaining_toks)
+                } else {
+                    // PIC miss — set context for within-request PIC, fall through to full prefill
+                    if !block_caches.is_empty() {
+                        pic::record_cache_miss();
+                    }
+                    let pic_ctx = pic::PicContext::new(pic_blocks);
+                    seq.set_pic_context(pic_ctx);
+                    seq
+                }
+            } else {
+                // No PIC blocks — use normal prefix caching
+                let prefill_cache = handle_seq_error!(
+                    get_mut_arcmutex!(self.prefix_cacher).search_for_matching_cache(
+                        seq.get_toks(),
+                        seq.image_hashes(),
+                        seq.audio_hashes(),
+                    ),
+                    request.response
+                );
+
+                match prefill_cache {
+                    Some(MatchingCache::Normal {
+                        normal,
+                        images_to_keep,
+                        audios_to_keep,
+                        toks,
+                        offset,
+                    }) => {
+                        self.logger.add_prefix_cache_hit();
+                        seq.keep_num_images(images_to_keep);
+                        seq.keep_num_audios(audios_to_keep);
+                        seq.prefill_v2_normal(normal, toks, offset)
+                    }
+                    None => seq,
+                }
             };
 
             *get_mut_arcmutex!(self.id) += 1;
