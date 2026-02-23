@@ -19,6 +19,7 @@ use crate::{
     },
     layers_masker::PastKvLenCache,
     paged_attention::{AttentionImplementation, ModelConfigMetadata, PagedAttention},
+    pic::{self, PicContext},
     pipeline::{
         extract_logits,
         text_models_inputs_processor::{FlashParams, PagedAttentionInputMetadata},
@@ -253,6 +254,7 @@ impl Attention {
         metadata: Option<((Tensor, Tensor), &PagedAttentionInputMetadata)>,
         flash_params: &FlashParams,
         _layer_idx: usize,
+        pic_context: Option<&PicContext>,
     ) -> Result<Tensor> {
         let (b_sz, q_len, _) = xs.dims3()?;
 
@@ -288,6 +290,45 @@ impl Attention {
             (q, k, v)
         };
 
+        // PIC path: deferred RoPE via shared helper
+        if let Some(pic_ctx) = pic_context {
+            if self.paged_attn.is_some() {
+                candle_core::bail!(
+                    "PIC (position-independent caching) is not supported with paged attention"
+                );
+            }
+            let rope: &dyn crate::pic::PicRope = match &self.rotary_emb {
+                GptOssRotaryEmbeddingVariant::Standard(r) => &**r,
+                GptOssRotaryEmbeddingVariant::Yarn(r) => &**r,
+            };
+            let mut y = pic::pic_sdpa_attention(
+                &q,
+                &k,
+                &v,
+                pic_ctx,
+                rope,
+                kv_cache,
+                attention_mask,
+                flash_params,
+                &self.sdpa_params,
+            )?;
+
+            if let Some(t) = self.q_proj.quantized_act_type() {
+                y = y.to_dtype(t)?;
+            }
+            y = if attention_mask.is_some() {
+                y.transpose(1, 2)?.reshape((b_sz, q_len, ()))?
+            } else {
+                y.reshape((b_sz, q_len, ()))?
+            };
+            let mut res = MatMul.qmethod_matmul(&y, &*self.o_proj)?;
+            if self.q_proj.quantized_act_type().is_some() {
+                res = res.to_dtype(original_dtype)?;
+            }
+            return Ok(res);
+        }
+
+        // Normal path (no PIC): apply RoPE before cache, original behavior
         (q, k) = self.rotary_emb.forward(&q, &k, seqlen_offsets)?;
         let mut attn_output = match &self.paged_attn {
             Some(paged_attn) => match metadata {
@@ -555,6 +596,7 @@ impl DecoderLayer {
         metadata: Option<((Tensor, Tensor), &PagedAttentionInputMetadata)>,
         flash_params: &FlashParams,
         layer_idx: usize,
+        pic_context: Option<&PicContext>,
     ) -> Result<Tensor> {
         let residual = xs;
         let xs = self.input_layernorm.forward(xs)?;
@@ -566,6 +608,7 @@ impl DecoderLayer {
             metadata,
             flash_params,
             layer_idx,
+            pic_context,
         )?;
         let xs = (residual + xs)?;
 
@@ -765,42 +808,71 @@ impl Model {
         context_lens: Vec<(usize, usize)>,
         metadata: Option<(Vec<(Tensor, Tensor)>, &PagedAttentionInputMetadata)>,
         flash_params: &FlashParams,
+        pic_context: Option<&PicContext>,
     ) -> Result<Tensor> {
         let mut xs = self.embed_tokens.forward(input_ids)?;
         let cache = &mut self.cache.normal().0;
 
         let sliding_window = self.cfg.sliding_window;
 
-        // Use the `_as_attn_bias` variants which always construct real masks.
-        // The standard `make_causal_mask_matrix` returns a dummy (1,1) tensor when
-        // flash-attn is enabled on CUDA, but the CPU sinks fallback needs a real mask.
-        let mask_cache: &dyn PastKvLenCache = metadata
-            .as_ref()
-            .map(|(_, _)| &seqlen_offsets as &dyn PastKvLenCache)
-            .unwrap_or(cache as &dyn PastKvLenCache);
-        let causal_mask =
-            CausalMasker.make_causal_mask_as_attn_bias(input_ids, mask_cache, xs.dtype())?;
+        // When PIC context is present, use block-attention mask instead of causal mask
+        let (causal_mask, sliding_mask) = if let Some(pic_ctx) = pic_context {
+            let (_b_sz, tgt_len) = input_ids.dims2()?;
+            if tgt_len == 1 {
+                (
+                    DeviceMappedMask::new(None, &*self.mapper)?,
+                    DeviceMappedMask::new(None, &*self.mapper)?,
+                )
+            } else {
+                let past_kv_len = cache[0].current_seq_len();
+                let pic_mask = pic_ctx.make_pic_mask(
+                    tgt_len,
+                    past_kv_len,
+                    xs.device(),
+                    xs.dtype(),
+                )?;
+                (
+                    DeviceMappedMask::new(Some(pic_mask), &*self.mapper)?,
+                    DeviceMappedMask::new(None, &*self.mapper)?,
+                )
+            }
+        } else {
+            // Use the `_as_attn_bias` variants which always construct real masks.
+            // The standard `make_causal_mask_matrix` returns a dummy (1,1) tensor when
+            // flash-attn is enabled on CUDA, but the CPU sinks fallback needs a real mask.
+            let mask_cache: &dyn PastKvLenCache = metadata
+                .as_ref()
+                .map(|(_, _)| &seqlen_offsets as &dyn PastKvLenCache)
+                .unwrap_or(cache as &dyn PastKvLenCache);
+            let causal_mask =
+                CausalMasker.make_causal_mask_as_attn_bias(input_ids, mask_cache, xs.dtype())?;
 
-        let sliding_mask = CausalMasker.make_sliding_window_causal_mask_as_attn_bias(
-            input_ids,
-            mask_cache,
-            sliding_window,
-            xs.dtype(),
-        )?;
+            let sliding_mask = CausalMasker.make_sliding_window_causal_mask_as_attn_bias(
+                input_ids,
+                mask_cache,
+                sliding_window,
+                xs.dtype(),
+            )?;
 
-        let should_use_mask = metadata
-            .as_ref()
-            .map(|(_, meta)| meta.is_first_prompt_chunk)
-            .unwrap_or(true);
-        let causal_mask = if should_use_mask { causal_mask } else { None };
-        let sliding_mask = if should_use_mask { sliding_mask } else { None };
-        let causal_mask = DeviceMappedMask::new(causal_mask, &*self.mapper)?;
-        let sliding_mask = DeviceMappedMask::new(sliding_mask, &*self.mapper)?;
+            let should_use_mask = metadata
+                .as_ref()
+                .map(|(_, meta)| meta.is_first_prompt_chunk)
+                .unwrap_or(true);
+            let causal_mask = if should_use_mask { causal_mask } else { None };
+            let sliding_mask = if should_use_mask { sliding_mask } else { None };
+            (
+                DeviceMappedMask::new(causal_mask, &*self.mapper)?,
+                DeviceMappedMask::new(sliding_mask, &*self.mapper)?,
+            )
+        };
 
         for (i, layer) in self.layers.iter().enumerate() {
             xs = self.mapper.map(xs, i)?;
 
-            let layer_mask = if layer.self_attn.is_sliding {
+            let layer_mask = if pic_context.is_some() {
+                // PIC mask applies uniformly to all layers
+                causal_mask.as_ref()
+            } else if layer.self_attn.is_sliding {
                 sliding_mask.as_ref().or(causal_mask.as_ref())
             } else {
                 causal_mask.as_ref()
@@ -814,6 +886,7 @@ impl Model {
                 metadata.as_ref().map(|(kv, m)| (kv[i].clone(), *m)),
                 flash_params,
                 i,
+                pic_context,
             )?;
         }
 
@@ -867,6 +940,41 @@ impl NormalModel for Model {
             context_lens,
             metadata,
             flash_params,
+            None, // no PIC context
+        )
+    }
+
+    fn pic_pre_rope_k(
+        &self,
+        k: &Tensor,
+        block_len: usize,
+    ) -> candle_core::Result<Option<Tensor>> {
+        use crate::pic::PicRope;
+        let rope: &dyn PicRope = match &self.layers[0].self_attn.rotary_emb {
+            GptOssRotaryEmbeddingVariant::Standard(r) => &**r,
+            GptOssRotaryEmbeddingVariant::Yarn(r) => &**r,
+        };
+        let positions: Vec<usize> = (0..block_len).collect();
+        Ok(Some(rope.pic_forward_k_only(k, &positions)?))
+    }
+
+    fn forward_pic(
+        &self,
+        input_ids: &Tensor,
+        seqlen_offsets: &[usize],
+        context_lens: Vec<(usize, usize)>,
+        _position_ids: Vec<usize>,
+        metadata: Option<(Vec<(Tensor, Tensor)>, &PagedAttentionInputMetadata)>,
+        flash_params: &FlashParams,
+        pic_context: Option<&PicContext>,
+    ) -> Result<Tensor> {
+        self.inner_forward(
+            input_ids,
+            seqlen_offsets,
+            context_lens,
+            metadata,
+            flash_params,
+            pic_context,
         )
     }
 

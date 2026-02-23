@@ -23,6 +23,7 @@ use crate::{
     layers_masker::PastKvLenCache,
     moe::{MoEExperts, MoEExpertsConfig},
     paged_attention::{AttentionImplementation, ModelConfigMetadata, PagedAttention},
+    pic::{self, PicContext},
     pipeline::{
         extract_logits,
         text_models_inputs_processor::{FlashParams, PagedAttentionInputMetadata},
@@ -873,6 +874,7 @@ impl FullAttention {
         kv_cache: &mut KvCache,
         metadata: Option<((Tensor, Tensor), &PagedAttentionInputMetadata)>,
         flash_params: &FlashParams,
+        pic_context: Option<&PicContext>,
     ) -> Result<Tensor> {
         let (b_sz, seq_len, _) = x.dims3()?;
         let original_dtype = x.dtype();
@@ -918,7 +920,46 @@ impl FullAttention {
         q = q.apply(&self.q_norm)?;
         k = k.apply(&self.k_norm)?;
 
-        // Apply partial RoPE
+        // PIC path: deferred RoPE via shared helper (handles partial rotary internally)
+        if let Some(pic_ctx) = pic_context {
+            if self.paged_attn.is_some() {
+                candle_core::bail!(
+                    "PIC (position-independent caching) is not supported with paged attention"
+                );
+            }
+            let mut y = pic::pic_sdpa_attention(
+                &q,
+                &k,
+                &v,
+                pic_ctx,
+                &*self.rotary_emb,
+                kv_cache,
+                attention_mask.as_ref(),
+                flash_params,
+                &self.sdpa_params,
+            )?;
+
+            if let Some(t) = self.q_proj.quantized_act_type() {
+                y = y.to_dtype(t)?;
+            }
+            y = if attention_mask.is_some() {
+                y.transpose(1, 2)?.reshape((b_sz, seq_len, ()))?
+            } else {
+                y.reshape((b_sz, seq_len, ()))?
+            };
+
+            // Apply output gate: y = y * sigmoid(gate)
+            let gate = candle_nn::ops::sigmoid(&gate.to_dtype(y.dtype())?)?;
+            y = y.broadcast_mul(&gate)?;
+
+            let mut res = MatMul.qmethod_matmul(&y, &*self.o_proj)?;
+            if self.q_proj.quantized_act_type().is_some() {
+                res = res.to_dtype(original_dtype)?;
+            }
+            return Ok(res);
+        }
+
+        // Normal path (no PIC): apply partial RoPE before cache
         if self.rot_dim < self.head_dim {
             let q_rot = q.narrow(D::Minus1, 0, self.rot_dim)?;
             let q_pass = q.narrow(D::Minus1, self.rot_dim, self.head_dim - self.rot_dim)?;
@@ -1221,6 +1262,7 @@ impl DecoderLayer {
         kv_cache: &mut KvCache,
         metadata: Option<((Tensor, Tensor), &PagedAttentionInputMetadata)>,
         flash_params: &FlashParams,
+        pic_context: Option<&PicContext>,
     ) -> Result<Tensor> {
         let attn = match &self.layer_impl {
             LayerImpl::FullAttention(attn) => attn,
@@ -1235,6 +1277,7 @@ impl DecoderLayer {
             kv_cache,
             metadata,
             flash_params,
+            pic_context,
         )?;
         let x = (attn_out + residual)?;
         let residual = &x;
@@ -1569,27 +1612,46 @@ impl Model {
         context_lens: Vec<(usize, usize)>,
         metadata: Option<(Vec<(Tensor, Tensor)>, &PagedAttentionInputMetadata)>,
         flash_params: &FlashParams,
+        pic_context: Option<&PicContext>,
     ) -> Result<Tensor> {
         let mut x = self.embed_tokens.forward(input_ids)?;
 
         let mut local_cache = self.local_cache.lock().unwrap();
 
-        let mask = CausalMasker.make_causal_mask_matrix(
-            input_ids,
-            metadata
-                .as_ref()
-                .map(|(_, _)| &seqlen_offsets as &dyn PastKvLenCache)
-                .unwrap_or(&*local_cache as &dyn PastKvLenCache),
-            x.dtype(),
-            self.num_attention_heads,
-        )?;
-        let mask = mask.filter(|_| {
-            metadata
-                .as_ref()
-                .map(|(_, meta)| meta.is_first_prompt_chunk)
-                .unwrap_or(true)
-        });
-        let mask = DeviceMappedMask::new(mask, &*self.mapper)?;
+        // When PIC context is present, use block-attention mask instead of causal mask
+        let mask = if let Some(pic_ctx) = pic_context {
+            let (_b_sz, tgt_len) = input_ids.dims2()?;
+            if tgt_len == 1 {
+                DeviceMappedMask::new(None, &*self.mapper)?
+            } else {
+                let past_kv_len = local_cache.seqlen();
+                let pic_mask = pic_ctx.make_pic_mask(
+                    tgt_len,
+                    past_kv_len,
+                    x.device(),
+                    x.dtype(),
+                )?;
+                DeviceMappedMask::new(Some(pic_mask), &*self.mapper)?
+            }
+        } else {
+            let mask = CausalMasker.make_causal_mask_matrix(
+                input_ids,
+                metadata
+                    .as_ref()
+                    .map(|(_, _)| &seqlen_offsets as &dyn PastKvLenCache)
+                    .unwrap_or(&*local_cache as &dyn PastKvLenCache),
+                x.dtype(),
+                self.num_attention_heads,
+            )?;
+            // PagedAttention prompt chunking
+            let mask = mask.filter(|_| {
+                metadata
+                    .as_ref()
+                    .map(|(_, meta)| meta.is_first_prompt_chunk)
+                    .unwrap_or(true)
+            });
+            DeviceMappedMask::new(mask, &*self.mapper)?
+        };
 
         for (layer_idx, layer) in self.layers.iter().enumerate() {
             x = self.mapper.map(x, layer_idx)?;
@@ -1608,6 +1670,7 @@ impl Model {
                                 (kv_cache[layer_idx].clone(), *metadata)
                             }),
                             flash_params,
+                            pic_context,
                         )?;
                     }
                 }
@@ -1742,6 +1805,44 @@ impl NormalModel for Model {
             context_lens,
             metadata,
             flash_params,
+            None,
+        )
+    }
+    fn pic_pre_rope_k(
+        &self,
+        k: &Tensor,
+        block_len: usize,
+    ) -> candle_core::Result<Option<Tensor>> {
+        use crate::pic::PicRope;
+        // Find the first FullAttention layer's rotary embedding
+        let rotary_emb = self
+            .layers
+            .iter()
+            .find_map(|layer| match &layer.layer_impl {
+                LayerImpl::FullAttention(attn) => Some(&*attn.rotary_emb),
+                _ => None,
+            })
+            .expect("No full attention layer found for PIC pre-RoPE");
+        let positions: Vec<usize> = (0..block_len).collect();
+        Ok(Some(rotary_emb.pic_forward_k_only(k, &positions)?))
+    }
+    fn forward_pic(
+        &self,
+        input_ids: &Tensor,
+        seqlen_offsets: &[usize],
+        context_lens: Vec<(usize, usize)>,
+        _position_ids: Vec<usize>,
+        metadata: Option<(Vec<(Tensor, Tensor)>, &PagedAttentionInputMetadata)>,
+        flash_params: &FlashParams,
+        pic_context: Option<&PicContext>,
+    ) -> Result<Tensor> {
+        self.forward(
+            input_ids,
+            seqlen_offsets,
+            context_lens,
+            metadata,
+            flash_params,
+            pic_context,
         )
     }
     fn xlora_forward(

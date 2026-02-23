@@ -325,6 +325,7 @@ impl MiniCpmOModel {
             context_lens,
             metadata,
             flash_params,
+            None,
         )
     }
 }

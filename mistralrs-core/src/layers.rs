@@ -21,6 +21,7 @@ use serde::{Deserialize, Serialize};
 pub use crate::attention::Sdpa;
 pub use crate::layers_masker::CausalMasker;
 pub use crate::layers_utils::repeat_kv;
+use crate::pic::PicRope;
 use crate::{
     amoe::{AnyMoeTrainableLayer, MlpLayer},
     embedding_models::embedding_gemma::EmbeddingGemmaConfig,
@@ -714,6 +715,98 @@ impl PhiRotaryEmbedding {
     }
 }
 
+impl PhiRotaryEmbedding {
+    /// Gather sin/cos for arbitrary position IDs from the given table.
+    fn gather_positions(table: &Tensor, positions: &[usize]) -> Result<Tensor> {
+        if positions.is_empty() {
+            return Tensor::zeros((0, table.dim(1)?), table.dtype(), table.device());
+        }
+        let idx_data: Vec<u32> = positions.iter().map(|&p| p as u32).collect();
+        let idx = Tensor::from_vec(idx_data, (positions.len(),), table.device())?;
+        table.index_select(&idx, 0)
+    }
+
+    /// Get the appropriate sin/cos tables for the given positions.
+    fn sin_cos_for_positions(&self, positions: &[usize]) -> (&Tensor, &Tensor) {
+        if self.long_cos.is_none() {
+            return (&self.short_sin, &self.short_cos);
+        }
+        let max_pos = positions.iter().copied().max().unwrap_or(0) + 1;
+        if max_pos > self.original_max_position_embeddings {
+            (
+                self.long_sin.as_ref().unwrap(),
+                self.long_cos.as_ref().unwrap(),
+            )
+        } else {
+            (&self.short_sin, &self.short_cos)
+        }
+    }
+}
+
+impl PicRope for PhiRotaryEmbedding {
+    fn pic_forward_per_token(
+        &self,
+        q: &Tensor,
+        k: &Tensor,
+        q_positions: &[usize],
+        k_positions: &[usize],
+    ) -> Result<(Tensor, Tensor)> {
+        // Use short tables (PIC positions are block-local, starting from 0)
+        let (q_sin, q_cos) = self.sin_cos_for_positions(q_positions);
+        let (k_sin, k_cos) = self.sin_cos_for_positions(k_positions);
+
+        let rot_dim = q_cos.dim(D::Minus1)? * 2;
+        let head_dim = q.dim(D::Minus1)?;
+
+        let q_cos_gathered = Self::gather_positions(q_cos, q_positions)?;
+        let q_sin_gathered = Self::gather_positions(q_sin, q_positions)?;
+        let k_cos_gathered = Self::gather_positions(k_cos, k_positions)?;
+        let k_sin_gathered = Self::gather_positions(k_sin, k_positions)?;
+
+        if rot_dim != head_dim {
+            // Partial rotary
+            let q_rot = q.narrow(D::Minus1, 0, rot_dim)?;
+            let q_pass = q.narrow(D::Minus1, rot_dim, head_dim - rot_dim)?;
+            let k_rot = k.narrow(D::Minus1, 0, rot_dim)?;
+            let k_pass = k.narrow(D::Minus1, rot_dim, head_dim - rot_dim)?;
+
+            let q_embed =
+                candle_nn::rotary_emb::rope(&q_rot.contiguous()?, &q_cos_gathered, &q_sin_gathered)?;
+            let k_embed =
+                candle_nn::rotary_emb::rope(&k_rot.contiguous()?, &k_cos_gathered, &k_sin_gathered)?;
+
+            Ok((
+                Tensor::cat(&[q_embed, q_pass], D::Minus1)?.contiguous()?,
+                Tensor::cat(&[k_embed, k_pass], D::Minus1)?.contiguous()?,
+            ))
+        } else {
+            let q_embed =
+                candle_nn::rotary_emb::rope(&q.contiguous()?, &q_cos_gathered, &q_sin_gathered)?;
+            let k_embed =
+                candle_nn::rotary_emb::rope(&k.contiguous()?, &k_cos_gathered, &k_sin_gathered)?;
+            Ok((q_embed, k_embed))
+        }
+    }
+
+    fn pic_forward_k_only(&self, k: &Tensor, k_positions: &[usize]) -> Result<Tensor> {
+        let (sin, cos) = self.sin_cos_for_positions(k_positions);
+        let k_cos = Self::gather_positions(cos, k_positions)?;
+        let k_sin = Self::gather_positions(sin, k_positions)?;
+
+        let rot_dim = cos.dim(D::Minus1)? * 2;
+        let head_dim = k.dim(D::Minus1)?;
+
+        if rot_dim != head_dim {
+            let k_rot = k.narrow(D::Minus1, 0, rot_dim)?;
+            let k_pass = k.narrow(D::Minus1, rot_dim, head_dim - rot_dim)?;
+            let k_embed = candle_nn::rotary_emb::rope(&k_rot.contiguous()?, &k_cos, &k_sin)?;
+            Tensor::cat(&[k_embed, k_pass], D::Minus1)?.contiguous()
+        } else {
+            candle_nn::rotary_emb::rope(&k.contiguous()?, &k_cos, &k_sin)
+        }
+    }
+}
+
 /// RoPE for Llama3
 #[derive(Debug, Clone)]
 pub struct Llama3RotaryEmbedding(RotaryEmbedding);
@@ -1058,6 +1151,22 @@ impl Llama3RotaryEmbedding {
     }
 }
 
+impl PicRope for Llama3RotaryEmbedding {
+    fn pic_forward_per_token(
+        &self,
+        q: &Tensor,
+        k: &Tensor,
+        q_positions: &[usize],
+        k_positions: &[usize],
+    ) -> Result<(Tensor, Tensor)> {
+        self.0.forward_per_token(q, k, q_positions, k_positions)
+    }
+
+    fn pic_forward_k_only(&self, k: &Tensor, k_positions: &[usize]) -> Result<Tensor> {
+        self.0.forward_k_only(k, k_positions)
+    }
+}
+
 /// RoPE for SmolLm3
 #[derive(Debug, Clone)]
 pub struct SmolLm3RotaryEmbedding(RotaryEmbedding);
@@ -1188,6 +1297,22 @@ impl SmolLm3RotaryEmbedding {
         seqlen_offsets: &[usize],
     ) -> Result<(Tensor, Tensor)> {
         self.0.forward(q, k, seqlen_offsets)
+    }
+}
+
+impl PicRope for SmolLm3RotaryEmbedding {
+    fn pic_forward_per_token(
+        &self,
+        q: &Tensor,
+        k: &Tensor,
+        q_positions: &[usize],
+        k_positions: &[usize],
+    ) -> Result<(Tensor, Tensor)> {
+        self.0.forward_per_token(q, k, q_positions, k_positions)
+    }
+
+    fn pic_forward_k_only(&self, k: &Tensor, k_positions: &[usize]) -> Result<Tensor> {
+        self.0.forward_k_only(k, k_positions)
     }
 }
 
@@ -1655,6 +1780,39 @@ impl DeepSeekV2RotaryEmbedding {
             }
             Ok((Tensor::cat(&q_embeds, 0)?, Tensor::cat(&k_embeds, 0)?))
         }
+    }
+
+    fn gather_positions(table: &Tensor, positions: &[usize]) -> Result<Tensor> {
+        if positions.is_empty() {
+            return Tensor::zeros((0, table.dim(1)?), table.dtype(), table.device());
+        }
+        let idx_data: Vec<u32> = positions.iter().map(|&p| p as u32).collect();
+        let idx = Tensor::from_vec(idx_data, (positions.len(),), table.device())?;
+        table.index_select(&idx, 0)
+    }
+}
+
+impl PicRope for DeepSeekV2RotaryEmbedding {
+    fn pic_forward_per_token(
+        &self,
+        q: &Tensor,
+        k: &Tensor,
+        q_positions: &[usize],
+        k_positions: &[usize],
+    ) -> Result<(Tensor, Tensor)> {
+        let q_cos = DeepSeekV2RotaryEmbedding::gather_positions(&self.cos, q_positions)?;
+        let q_sin = DeepSeekV2RotaryEmbedding::gather_positions(&self.sin, q_positions)?;
+        let k_cos = DeepSeekV2RotaryEmbedding::gather_positions(&self.cos, k_positions)?;
+        let k_sin = DeepSeekV2RotaryEmbedding::gather_positions(&self.sin, k_positions)?;
+        let q_embed = candle_nn::rotary_emb::rope_i(&q.contiguous()?, &q_cos, &q_sin)?;
+        let k_embed = candle_nn::rotary_emb::rope_i(&k.contiguous()?, &k_cos, &k_sin)?;
+        Ok((q_embed, k_embed))
+    }
+
+    fn pic_forward_k_only(&self, k: &Tensor, k_positions: &[usize]) -> Result<Tensor> {
+        let k_cos = DeepSeekV2RotaryEmbedding::gather_positions(&self.cos, k_positions)?;
+        let k_sin = DeepSeekV2RotaryEmbedding::gather_positions(&self.sin, k_positions)?;
+        candle_nn::rotary_emb::rope_i(&k.contiguous()?, &k_cos, &k_sin)
     }
 }
 
@@ -2398,6 +2556,22 @@ impl RotaryEmbedding {
     }
 }
 
+impl PicRope for RotaryEmbedding {
+    fn pic_forward_per_token(
+        &self,
+        q: &Tensor,
+        k: &Tensor,
+        q_positions: &[usize],
+        k_positions: &[usize],
+    ) -> Result<(Tensor, Tensor)> {
+        self.forward_per_token(q, k, q_positions, k_positions)
+    }
+
+    fn pic_forward_k_only(&self, k: &Tensor, k_positions: &[usize]) -> Result<Tensor> {
+        self.forward_k_only(k, k_positions)
+    }
+}
+
 /// GPT-OSS style rotary embedding with YARN scaling support.
 /// Uses chunked/GPT-NeoX style rotation and applies attention scaling.
 #[derive(Debug, Clone)]
@@ -2581,6 +2755,40 @@ impl GptOssRotaryEmbedding {
             }
             Ok((Tensor::cat(&q_embeds, 0)?, Tensor::cat(&k_embeds, 0)?))
         }
+    }
+
+    fn gather_positions(table: &Tensor, positions: &[usize]) -> Result<Tensor> {
+        if positions.is_empty() {
+            return Tensor::zeros((0, table.dim(1)?), table.dtype(), table.device());
+        }
+        let idx_data: Vec<u32> = positions.iter().map(|&p| p as u32).collect();
+        let idx = Tensor::from_vec(idx_data, (positions.len(),), table.device())?;
+        table.index_select(&idx, 0)
+    }
+}
+
+impl PicRope for GptOssRotaryEmbedding {
+    fn pic_forward_per_token(
+        &self,
+        q: &Tensor,
+        k: &Tensor,
+        q_positions: &[usize],
+        k_positions: &[usize],
+    ) -> Result<(Tensor, Tensor)> {
+        let q_cos = GptOssRotaryEmbedding::gather_positions(&self.cos, q_positions)?;
+        let q_sin = GptOssRotaryEmbedding::gather_positions(&self.sin, q_positions)?;
+        let k_cos = GptOssRotaryEmbedding::gather_positions(&self.cos, k_positions)?;
+        let k_sin = GptOssRotaryEmbedding::gather_positions(&self.sin, k_positions)?;
+        // Uses GPT-NeoX style (chunked) rotation
+        let q_embed = candle_nn::rotary_emb::rope(&q.contiguous()?, &q_cos, &q_sin)?;
+        let k_embed = candle_nn::rotary_emb::rope(&k.contiguous()?, &k_cos, &k_sin)?;
+        Ok((q_embed, k_embed))
+    }
+
+    fn pic_forward_k_only(&self, k: &Tensor, k_positions: &[usize]) -> Result<Tensor> {
+        let k_cos = GptOssRotaryEmbedding::gather_positions(&self.cos, k_positions)?;
+        let k_sin = GptOssRotaryEmbedding::gather_positions(&self.sin, k_positions)?;
+        candle_nn::rotary_emb::rope(&k.contiguous()?, &k_cos, &k_sin)
     }
 }
 

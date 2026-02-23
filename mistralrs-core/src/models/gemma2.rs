@@ -20,6 +20,7 @@ use crate::{
     },
     layers_masker::PastKvLenCache,
     paged_attention::{AttentionImplementation, ModelConfigMetadata, PagedAttention},
+    pic::{self, PicContext},
     pipeline::{
         extract_logits,
         text_models_inputs_processor::{FlashParams, PagedAttentionInputMetadata},
@@ -176,6 +177,7 @@ impl Attention {
         kv_cache: &mut KvCache,
         metadata: Option<((Tensor, Tensor), &PagedAttentionInputMetadata)>,
         flash_params: &FlashParams,
+        pic_context: Option<&PicContext>,
     ) -> Result<Tensor> {
         let (b_sz, q_len, _) = xs.dims3()?;
 
@@ -211,6 +213,46 @@ impl Attention {
             (q, k, v)
         };
 
+        // PIC path: deferred RoPE via shared helper
+        if let Some(pic_ctx) = pic_context {
+            if self.paged_attn.is_some() {
+                candle_core::bail!(
+                    "PIC (position-independent caching) is not supported with paged attention"
+                );
+            }
+            let mask = if self.use_sliding_window {
+                sliding_attention_mask
+            } else {
+                attention_mask
+            };
+            let mut y = pic::pic_sdpa_attention(
+                &q,
+                &k,
+                &v,
+                pic_ctx,
+                &*self.rotary_emb,
+                kv_cache,
+                mask,
+                flash_params,
+                &self.sdpa_params,
+            )?;
+
+            if let Some(t) = self.q_proj.quantized_act_type() {
+                y = y.to_dtype(t)?;
+            }
+            y = if attention_mask.is_some() {
+                y.transpose(1, 2)?.reshape((b_sz, q_len, ()))?
+            } else {
+                y.reshape((b_sz, q_len, ()))?
+            };
+            let mut res = MatMul.qmethod_matmul(&y, &*self.o_proj)?;
+            if self.q_proj.quantized_act_type().is_some() {
+                res = res.to_dtype(original_dtype)?;
+            }
+            return Ok(res);
+        }
+
+        // Normal path (no PIC): apply RoPE before cache
         let (q, k) = self.rotary_emb.forward(&q, &k, seqlen_offsets)?;
 
         let mask = if self.use_sliding_window {
@@ -352,6 +394,7 @@ impl DecoderLayer {
         kv_cache: &mut KvCache,
         metadata: Option<((Tensor, Tensor), &PagedAttentionInputMetadata)>,
         flash_params: &FlashParams,
+        pic_context: Option<&PicContext>,
     ) -> Result<Tensor> {
         let residual = xs;
         let xs = self.input_layernorm.forward(xs)?;
@@ -365,6 +408,7 @@ impl DecoderLayer {
                 kv_cache,
                 metadata,
                 flash_params,
+                pic_context,
             )?
             .apply(&self.post_attention_layernorm)?;
         let xs = (xs + residual)?;
@@ -514,45 +558,91 @@ impl Model {
         context_lens: Vec<(usize, usize)>,
         metadata: Option<(Vec<(Tensor, Tensor)>, &PagedAttentionInputMetadata)>,
         flash_params: &FlashParams,
+        pic_context: Option<&PicContext>,
     ) -> Result<Tensor> {
-        let xs = self.embed_tokens.forward(input_ids)?;
-        let mut xs = (xs * (self.hidden_size as f64).sqrt())?;
+        self.forward_embed(
+            input_ids,
+            self.embed_tokens.forward(input_ids)?,
+            seqlen_offsets,
+            context_lens,
+            metadata,
+            flash_params,
+            pic_context,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_embed(
+        &self,
+        input_ids: &Tensor,
+        input_embeds: Tensor,
+        seqlen_offsets: &[usize],
+        context_lens: Vec<(usize, usize)>,
+        metadata: Option<(Vec<(Tensor, Tensor)>, &PagedAttentionInputMetadata)>,
+        flash_params: &FlashParams,
+        pic_context: Option<&PicContext>,
+    ) -> Result<Tensor> {
+        let mut xs = (input_embeds * (self.hidden_size as f64).sqrt())?;
         let cache = &mut self.cache.normal().0;
-        let attention_mask = CausalMasker.make_causal_mask_matrix(
-            input_ids,
-            metadata
-                .as_ref()
-                .map(|(_, _)| &seqlen_offsets as &dyn PastKvLenCache)
-                .unwrap_or(cache as &dyn PastKvLenCache),
-            xs.dtype(),
-            self.cfg.num_attn_heads,
-        )?;
-        // PagedAttention prompt chunking
-        let attention_mask = attention_mask.filter(|_| {
-            metadata
-                .as_ref()
-                .map(|(_, meta)| meta.is_first_prompt_chunk)
-                .unwrap_or(true)
-        });
-        let sliding_attention_mask = CausalMasker.make_sliding_window_causal_mask_matrix(
-            input_ids,
-            metadata
-                .as_ref()
-                .map(|(_, _)| &seqlen_offsets as &dyn PastKvLenCache)
-                .unwrap_or(cache as &dyn PastKvLenCache),
-            Some(self.sliding_window),
-            xs.dtype(),
-            self.cfg.num_attn_heads,
-        )?;
-        // PagedAttention prompt chunking
-        let sliding_attention_mask = sliding_attention_mask.filter(|_| {
-            metadata
-                .as_ref()
-                .map(|(_, meta)| meta.is_first_prompt_chunk)
-                .unwrap_or(true)
-        });
-        let attention_mask = DeviceMappedMask::new(attention_mask, &*self.mapper)?;
-        let sliding_attention_mask = DeviceMappedMask::new(sliding_attention_mask, &*self.mapper)?;
+        // When PIC context is present, use block-attention mask instead of causal mask
+        let attention_mask = if let Some(pic_ctx) = pic_context {
+            let (_b_sz, tgt_len) = input_ids.dims2()?;
+            if tgt_len == 1 {
+                DeviceMappedMask::new(None, &*self.mapper)?
+            } else {
+                let past_kv_len = cache[0].current_seq_len();
+                let pic_mask = pic_ctx.make_pic_mask(
+                    tgt_len,
+                    past_kv_len,
+                    xs.device(),
+                    xs.dtype(),
+                )?;
+                DeviceMappedMask::new(Some(pic_mask), &*self.mapper)?
+            }
+        } else {
+            let mask = CausalMasker.make_causal_mask_matrix(
+                input_ids,
+                metadata
+                    .as_ref()
+                    .map(|(_, _)| &seqlen_offsets as &dyn PastKvLenCache)
+                    .unwrap_or(cache as &dyn PastKvLenCache),
+                xs.dtype(),
+                self.cfg.num_attn_heads,
+            )?;
+            // PagedAttention prompt chunking
+            let mask = mask.filter(|_| {
+                metadata
+                    .as_ref()
+                    .map(|(_, meta)| meta.is_first_prompt_chunk)
+                    .unwrap_or(true)
+            });
+            DeviceMappedMask::new(mask, &*self.mapper)?
+        };
+
+        // For PIC, use the same mask for sliding window layers (the PIC mask
+        // already encodes the correct block-attention pattern).
+        let sliding_attention_mask = if pic_context.is_some() {
+            attention_mask.clone()
+        } else {
+            let mask = CausalMasker.make_sliding_window_causal_mask_matrix(
+                input_ids,
+                metadata
+                    .as_ref()
+                    .map(|(_, _)| &seqlen_offsets as &dyn PastKvLenCache)
+                    .unwrap_or(cache as &dyn PastKvLenCache),
+                Some(self.sliding_window),
+                xs.dtype(),
+                self.cfg.num_attn_heads,
+            )?;
+            // PagedAttention prompt chunking
+            let mask = mask.filter(|_| {
+                metadata
+                    .as_ref()
+                    .map(|(_, meta)| meta.is_first_prompt_chunk)
+                    .unwrap_or(true)
+            });
+            DeviceMappedMask::new(mask, &*self.mapper)?
+        };
         for (i, layer) in self.layers.iter().enumerate() {
             xs = self.mapper.map(xs, i)?;
             xs = layer.forward(
@@ -565,6 +655,7 @@ impl Model {
                     .as_ref()
                     .map(|(kv_cache, metadata)| (kv_cache[i].clone(), *metadata)),
                 flash_params,
+                pic_context,
             )?;
         }
         let xs = xs.to_device(&self.device)?;
@@ -670,8 +761,41 @@ impl NormalModel for Model {
             context_lens,
             metadata,
             flash_params,
+            None, // no PIC context
         )
     }
+
+    fn pic_pre_rope_k(
+        &self,
+        k: &Tensor,
+        block_len: usize,
+    ) -> candle_core::Result<Option<Tensor>> {
+        use crate::pic::PicRope;
+        let rotary_emb = &*self.layers[0].self_attn.rotary_emb;
+        let positions: Vec<usize> = (0..block_len).collect();
+        Ok(Some(rotary_emb.pic_forward_k_only(k, &positions)?))
+    }
+
+    fn forward_pic(
+        &self,
+        input_ids: &Tensor,
+        seqlen_offsets: &[usize],
+        context_lens: Vec<(usize, usize)>,
+        _position_ids: Vec<usize>,
+        metadata: Option<(Vec<(Tensor, Tensor)>, &PagedAttentionInputMetadata)>,
+        flash_params: &FlashParams,
+        pic_context: Option<&PicContext>,
+    ) -> Result<Tensor> {
+        self.forward(
+            input_ids,
+            seqlen_offsets,
+            context_lens,
+            metadata,
+            flash_params,
+            pic_context,
+        )
+    }
+
     fn xlora_forward(
         &self,
         _input_ids: &Tensor,

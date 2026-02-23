@@ -110,81 +110,25 @@ impl CausalSelfAttention {
             (q, k, v)
         };
 
-        // PIC path: deferred RoPE - store raw K, apply RoPE after cache append
+        // PIC path: deferred RoPE via shared helper
         // Normal path: apply RoPE before cache append (original behavior)
         if let Some(pic_ctx) = pic_context {
-            // PIC: Store raw (un-RoPE'd) K in cache, apply RoPE at attention time
-            let mut y = match &self.paged_attn {
-                Some(_) => {
-                    // PIC is not yet supported with paged attention
-                    candle_core::bail!(
-                        "PIC (position-independent caching) is not supported with paged attention"
-                    );
-                }
-                None if pic_ctx.has_pre_roped_k => {
-                    // Cached Plus blocks already have RoPE'd K. Only apply RoPE
-                    // to the new (Cross) tokens, then append to cache.
-                    let past_kv_len = kv_cache.current_seq_len();
-                    let (q_positions, _) =
-                        pic::compute_pic_rope_positions(pic_ctx, seq_len, past_kv_len);
-                    // Positions for the new K tokens only
-                    let k_new_positions: Vec<usize> = (past_kv_len..past_kv_len + seq_len)
-                        .map(|i| {
-                            if i < pic_ctx.position_ids.len() {
-                                pic_ctx.position_ids[i]
-                            } else {
-                                i
-                            }
-                        })
-                        .collect();
-
-                    // RoPE only the new Q and K
-                    let (q_roped, k_roped) = self.rotary_emb.forward_per_token(
-                        &q,
-                        &k,
-                        &q_positions,
-                        &k_new_positions,
-                    )?;
-
-                    // Append RoPE'd K to cache (cached tokens are already RoPE'd)
-                    let (k_all, v_all) = kv_cache.append(&k_roped, &v)?;
-
-                    Sdpa.run_attention(
-                        &q_roped,
-                        &k_all,
-                        &v_all,
-                        attention_mask.clone().as_ref(),
-                        Some(flash_params),
-                        &self.sdpa_params,
-                    )?
-                }
-                None => {
-                    // Initial PIC: append raw K and RoPE the full cache
-                    let (k_all, v_all) = kv_cache.append(&k, &v)?;
-
-                    // Compute position IDs for Q (new tokens) and K (all cached tokens)
-                    let past_kv_len = k_all.dim(2)? - seq_len;
-                    let (q_positions, k_positions) =
-                        pic::compute_pic_rope_positions(pic_ctx, seq_len, past_kv_len);
-
-                    // Apply RoPE with per-token positions
-                    let (q_roped, k_roped) = self.rotary_emb.forward_per_token(
-                        &q,
-                        &k_all,
-                        &q_positions,
-                        &k_positions,
-                    )?;
-
-                    Sdpa.run_attention(
-                        &q_roped,
-                        &k_roped,
-                        &v_all,
-                        attention_mask.clone().as_ref(),
-                        Some(flash_params),
-                        &self.sdpa_params,
-                    )?
-                }
-            };
+            if self.paged_attn.is_some() {
+                candle_core::bail!(
+                    "PIC (position-independent caching) is not supported with paged attention"
+                );
+            }
+            let mut y = pic::pic_sdpa_attention(
+                &q,
+                &k,
+                &v,
+                pic_ctx,
+                &*self.rotary_emb,
+                kv_cache,
+                attention_mask.clone().as_ref(),
+                flash_params,
+                &self.sdpa_params,
+            )?;
 
             if let Some(t) = self.q_proj.quantized_act_type() {
                 y = y.to_dtype(t)?;
@@ -750,9 +694,10 @@ impl NormalModel for Llama {
         k: &Tensor,
         block_len: usize,
     ) -> candle_core::Result<Option<Tensor>> {
-        let rotary_emb = &self.blocks[0].attn.rotary_emb;
+        use crate::pic::PicRope;
+        let rotary_emb = &*self.blocks[0].attn.rotary_emb;
         let positions: Vec<usize> = (0..block_len).collect();
-        Ok(Some(rotary_emb.forward_k_only(k, &positions)?))
+        Ok(Some(rotary_emb.pic_forward_k_only(k, &positions)?))
     }
 
     fn forward_pic(

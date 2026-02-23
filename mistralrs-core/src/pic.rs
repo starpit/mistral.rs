@@ -23,6 +23,110 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use candle_core::{DType, Device, Result, Tensor};
 
+use crate::attention::SdpaParams;
+use crate::kv_cache::KvCache;
+use crate::layers::Sdpa;
+use crate::pipeline::text_models_inputs_processor::FlashParams;
+
+// ---------------------------------------------------------------------------
+// PicRope trait — implemented by all RoPE types that support PIC
+// ---------------------------------------------------------------------------
+
+/// Trait for RoPE implementations that support per-token position IDs,
+/// required for Position-Independent Caching.
+pub trait PicRope: Send + Sync {
+    /// Apply RoPE to Q and K with per-token position IDs.
+    ///
+    /// Batch size must be 1. `q_positions` has length = Q seq_len,
+    /// `k_positions` has length = K seq_len.
+    fn pic_forward_per_token(
+        &self,
+        q: &Tensor,
+        k: &Tensor,
+        q_positions: &[usize],
+        k_positions: &[usize],
+    ) -> Result<(Tensor, Tensor)>;
+
+    /// Apply RoPE to K only at the given positions.
+    /// Used to pre-compute RoPE'd K at cache save time.
+    fn pic_forward_k_only(&self, k: &Tensor, k_positions: &[usize]) -> Result<Tensor>;
+}
+
+// ---------------------------------------------------------------------------
+// Shared PIC attention helper
+// ---------------------------------------------------------------------------
+
+/// Run SDPA attention with PIC-aware deferred RoPE.
+///
+/// This is the shared helper that all models call in their PIC attention path.
+/// It handles both the initial-fill case (raw K, RoPE full cache) and the
+/// cache-reuse case (pre-RoPE'd K, RoPE only new tokens).
+///
+/// `q`, `k`, `v` should already be projected and reshaped to
+/// `(batch, heads, seq_len, head_dim)` but NOT yet RoPE'd.
+pub fn pic_sdpa_attention(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    pic_ctx: &PicContext,
+    rope: &dyn PicRope,
+    kv_cache: &mut KvCache,
+    attention_mask: Option<&Tensor>,
+    flash_params: &FlashParams,
+    sdpa_params: &SdpaParams,
+) -> Result<Tensor> {
+    let seq_len = q.dim(2)?;
+
+    if pic_ctx.has_pre_roped_k {
+        // Cached Plus blocks already have RoPE'd K. Only apply RoPE
+        // to the new (Cross) tokens, then append to cache.
+        let past_kv_len = kv_cache.current_seq_len();
+        let (q_positions, _) = compute_pic_rope_positions(pic_ctx, seq_len, past_kv_len);
+        let k_new_positions: Vec<usize> = (past_kv_len..past_kv_len + seq_len)
+            .map(|i| {
+                if i < pic_ctx.position_ids.len() {
+                    pic_ctx.position_ids[i]
+                } else {
+                    i
+                }
+            })
+            .collect();
+
+        let (q_roped, k_roped) =
+            rope.pic_forward_per_token(q, k, &q_positions, &k_new_positions)?;
+
+        let (k_all, v_all) = kv_cache.append(&k_roped, v)?;
+
+        Sdpa.run_attention(
+            &q_roped,
+            &k_all,
+            &v_all,
+            attention_mask,
+            Some(flash_params),
+            sdpa_params,
+        )
+    } else {
+        // Initial PIC: append raw K and RoPE the full cache
+        let (k_all, v_all) = kv_cache.append(k, v)?;
+
+        let past_kv_len = k_all.dim(2)? - seq_len;
+        let (q_positions, k_positions) =
+            compute_pic_rope_positions(pic_ctx, seq_len, past_kv_len);
+
+        let (q_roped, k_roped) =
+            rope.pic_forward_per_token(q, &k_all, &q_positions, &k_positions)?;
+
+        Sdpa.run_attention(
+            &q_roped,
+            &k_roped,
+            &v_all,
+            attention_mask,
+            Some(flash_params),
+            sdpa_params,
+        )
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Global PIC cache hit counter (for benchmarking / diagnostics)
 // ---------------------------------------------------------------------------

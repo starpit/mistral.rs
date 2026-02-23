@@ -20,6 +20,7 @@ use crate::{
     layers::{embedding, CausalMasker, MatMul, RmsNorm, RotaryEmbedding, Sdpa},
     layers_masker::PastKvLenCache,
     paged_attention::{AttentionImplementation, ModelConfigMetadata, PagedAttention},
+    pic::{self, PicContext},
     pipeline::{
         extract_logits,
         text_models_inputs_processor::{FlashParams, PagedAttentionInputMetadata},
@@ -1230,6 +1231,7 @@ impl CausalSelfAttention {
         kv_cache: &mut KvCache,
         metadata: Option<((Tensor, Tensor), &PagedAttentionInputMetadata)>,
         flash_params: &FlashParams,
+        pic_context: Option<&PicContext>,
     ) -> Result<Tensor> {
         let (b_sz, seq_len, _) = x.dims3()?;
 
@@ -1265,6 +1267,41 @@ impl CausalSelfAttention {
             (q, k, v)
         };
 
+        // PIC path: deferred RoPE via shared helper (only when rotary_emb is Some)
+        if let (Some(pic_ctx), Some(ref rotary_emb)) = (pic_context, &self.rotary_emb) {
+            if self.paged_attn.is_some() {
+                candle_core::bail!(
+                    "PIC (position-independent caching) is not supported with paged attention"
+                );
+            }
+            let mut y = pic::pic_sdpa_attention(
+                &q,
+                &k,
+                &v,
+                pic_ctx,
+                &**rotary_emb,
+                kv_cache,
+                attention_mask.clone().as_ref(),
+                flash_params,
+                &self.sdpa_params,
+            )?;
+
+            if let Some(t) = self.q_proj.quantized_act_type() {
+                y = y.to_dtype(t)?;
+            }
+            y = if attention_mask.is_some() {
+                y.transpose(1, 2)?.reshape((b_sz, seq_len, ()))?
+            } else {
+                y.reshape((b_sz, seq_len, ()))?
+            };
+            let mut res = MatMul.qmethod_matmul(&y, &*self.o_proj)?;
+            if self.q_proj.quantized_act_type().is_some() {
+                res = res.to_dtype(original_dtype)?;
+            }
+            return Ok(res);
+        }
+
+        // Normal path (no PIC): apply RoPE before cache, original behavior
         // Apply rotary embeddings only if position_embedding_type is not "nope"
         (q, k) = if let Some(ref rotary_emb) = self.rotary_emb {
             rotary_emb.forward(&q, &k, seqlen_offsets)?
@@ -1422,6 +1459,7 @@ impl Block {
         kv_cache: &mut KvCache,
         metadata: Option<((Tensor, Tensor), &PagedAttentionInputMetadata)>,
         flash_params: &FlashParams,
+        pic_context: Option<&PicContext>,
     ) -> Result<Tensor> {
         let residual = x;
         let x = self.rms_1.forward(x)?;
@@ -1432,6 +1470,7 @@ impl Block {
             kv_cache,
             metadata,
             flash_params,
+            pic_context,
         )?;
         // Scale residual connection
         let attn_out = scale_tensor(attn_out, self.residual_multiplier)?;
@@ -1873,6 +1912,7 @@ impl GraniteMoeHybrid {
         context_lens: Vec<(usize, usize)>,
         metadata: Option<(Vec<(Tensor, Tensor)>, &PagedAttentionInputMetadata)>,
         flash_params: &FlashParams,
+        pic_context: Option<&PicContext>,
     ) -> Result<Tensor> {
         let (_batch_size, _seq_len) = input_ids.dims2()?;
         let mut x = self.wte.forward(input_ids)?;
@@ -1886,24 +1926,41 @@ impl GraniteMoeHybrid {
         // Get state_indices for Mamba layers from pipeline cache
         let state_indices = pipeline_cache.state_indices().cloned();
 
-        // Build attention mask - use seqlen_offsets for attention layers
-        let mask = CausalMasker.make_causal_mask_matrix(
-            input_ids,
-            metadata
-                .as_ref()
-                .map(|(_, _)| &seqlen_offsets as &dyn PastKvLenCache)
-                .unwrap_or(&*internal_cache as &dyn PastKvLenCache),
-            x.dtype(),
-            self.num_attention_heads,
-        )?;
-        // PagedAttention prompt chunking
-        let mask = mask.filter(|_| {
-            metadata
-                .as_ref()
-                .map(|(_, meta)| meta.is_first_prompt_chunk)
-                .unwrap_or(true)
-        });
-        let mask = DeviceMappedMask::new(mask, &*self.mapper)?;
+        // When PIC context is present, use block-attention mask instead of causal mask
+        let mask = if let Some(pic_ctx) = pic_context {
+            let (_b_sz, tgt_len) = input_ids.dims2()?;
+            if tgt_len == 1 {
+                DeviceMappedMask::new(None, &*self.mapper)?
+            } else {
+                let past_kv_len = internal_cache.seqlen();
+                let pic_mask = pic_ctx.make_pic_mask(
+                    tgt_len,
+                    past_kv_len,
+                    x.device(),
+                    x.dtype(),
+                )?;
+                DeviceMappedMask::new(Some(pic_mask), &*self.mapper)?
+            }
+        } else {
+            // Build attention mask - use seqlen_offsets for attention layers
+            let mask = CausalMasker.make_causal_mask_matrix(
+                input_ids,
+                metadata
+                    .as_ref()
+                    .map(|(_, _)| &seqlen_offsets as &dyn PastKvLenCache)
+                    .unwrap_or(&*internal_cache as &dyn PastKvLenCache),
+                x.dtype(),
+                self.num_attention_heads,
+            )?;
+            // PagedAttention prompt chunking
+            let mask = mask.filter(|_| {
+                metadata
+                    .as_ref()
+                    .map(|(_, meta)| meta.is_first_prompt_chunk)
+                    .unwrap_or(true)
+            });
+            DeviceMappedMask::new(mask, &*self.mapper)?
+        };
 
         for (layer_idx, layer) in self.layers.iter().enumerate() {
             x = self.mapper.map(x, layer_idx)?;
@@ -1924,6 +1981,7 @@ impl GraniteMoeHybrid {
                                 (kv_cache[layer_idx].clone(), *metadata)
                             }),
                             flash_params,
+                            pic_context,
                         )?;
                     }
                 }
@@ -2115,6 +2173,44 @@ impl NormalModel for GraniteMoeHybrid {
             context_lens,
             metadata,
             flash_params,
+            None, // no PIC context
+        )
+    }
+    fn pic_pre_rope_k(
+        &self,
+        k: &Tensor,
+        block_len: usize,
+    ) -> candle_core::Result<Option<Tensor>> {
+        use crate::pic::PicRope;
+        // Find the first attention layer that has a rotary embedding
+        for layer in &self.layers {
+            if let DecoderLayer::Attention(block) = layer {
+                if let Some(ref rotary_emb) = block.attn.rotary_emb {
+                    let positions: Vec<usize> = (0..block_len).collect();
+                    return Ok(Some(rotary_emb.pic_forward_k_only(k, &positions)?));
+                }
+            }
+        }
+        // No attention layer with RoPE found (all "nope") — no pre-RoPE needed
+        Ok(None)
+    }
+    fn forward_pic(
+        &self,
+        input_ids: &Tensor,
+        seqlen_offsets: &[usize],
+        context_lens: Vec<(usize, usize)>,
+        _position_ids: Vec<usize>,
+        metadata: Option<(Vec<(Tensor, Tensor)>, &PagedAttentionInputMetadata)>,
+        flash_params: &FlashParams,
+        pic_context: Option<&PicContext>,
+    ) -> Result<Tensor> {
+        self.forward(
+            input_ids,
+            seqlen_offsets,
+            context_lens,
+            metadata,
+            flash_params,
+            pic_context,
         )
     }
     fn xlora_forward(
