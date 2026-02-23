@@ -802,15 +802,20 @@ impl Engine {
                 let pic_blocks = pic_blocks.unwrap();
                 let cacher = get_mut_arcmutex!(self.prefix_cacher);
                 let mut all_hit = true;
-                let mut block_caches = Vec::new();
+                // Each entry: (block, (cache, roped_k))
+                type PicHitEntry = (
+                    pic::PicBlock,
+                    crate::prefix_cacher::PicBlockSearchResult,
+                );
+                let mut block_caches: Vec<PicHitEntry> = Vec::new();
 
                 for block in &pic_blocks {
                     if block.is_plus {
                         if let Some(hash) = block.content_hash {
                             let toks = &seq.get_toks()[block.start..block.start + block.len];
                             match cacher.search_for_pic_block(toks, hash) {
-                                Ok(Some(cache)) => {
-                                    block_caches.push((block.clone(), cache));
+                                Ok(Some(result)) => {
+                                    block_caches.push((block.clone(), result));
                                 }
                                 _ => {
                                     all_hit = false;
@@ -831,61 +836,91 @@ impl Engine {
                         block_caches.len()
                     );
 
-                    let num_layers = block_caches[0].1.len();
+                    let num_layers = block_caches[0].1 .0.len();
                     let mut composite_cache: Vec<Option<crate::pipeline::KvCache>> =
                         vec![None; num_layers];
+                    // Track whether ALL blocks have pre-RoPE'd K
+                    let all_have_roped_k = block_caches
+                        .iter()
+                        .all(|(_, (_, roped_k))| roped_k.is_some());
 
                     for layer_idx in 0..num_layers {
-                        let mut layer_k_parts = Vec::new();
-                        let mut layer_v_parts = Vec::new();
-                        let mut any_data = false;
+                        // Collect block parts and compute total sequence length.
+                        // Use pre-RoPE'd K when available (all blocks must have it).
+                        let mut parts: Vec<(candle_core::Tensor, candle_core::Tensor)> = Vec::new();
+                        let mut total_len = 0usize;
 
-                        for (_, block_cache) in &block_caches {
+                        for (_, (block_cache, roped_k)) in &block_caches {
                             if let Some(Some(kv)) = block_cache.get(layer_idx) {
-                                if let (Ok(Some(k)), Ok(Some(v))) = (kv.k(), kv.v()) {
-                                    layer_k_parts.push(k);
-                                    layer_v_parts.push(v);
-                                    any_data = true;
+                                if let (Ok(Some(raw_k)), Ok(Some(v))) = (kv.k(), kv.v()) {
+                                    // Use pre-RoPE'd K if all blocks have it
+                                    let k = if all_have_roped_k {
+                                        roped_k
+                                            .as_ref()
+                                            .and_then(|rk| rk.get(layer_idx))
+                                            .and_then(|rk| rk.clone())
+                                            .unwrap_or(raw_k)
+                                    } else {
+                                        raw_k
+                                    };
+                                    total_len += k.dim(2).unwrap_or(0);
+                                    parts.push((k, v));
                                 }
                             }
                         }
 
-                        if any_data && !layer_k_parts.is_empty() {
-                            let cat_k = if layer_k_parts.len() > 1 {
-                                candle_core::Tensor::cat(&layer_k_parts, 2)
-                            } else {
-                                Ok(layer_k_parts[0].clone())
-                            };
-                            let cat_v = if layer_v_parts.len() > 1 {
-                                candle_core::Tensor::cat(&layer_v_parts, 2)
-                            } else {
-                                Ok(layer_v_parts[0].clone())
-                            };
+                        if !parts.is_empty() && total_len > 0 {
+                            // Pre-allocate output tensors and fill with slice_set
+                            let (ref first_k, ref first_v) = parts[0];
+                            let mut k_shape = first_k.dims().to_vec();
+                            k_shape[2] = total_len;
+                            let mut v_shape = first_v.dims().to_vec();
+                            v_shape[2] = total_len;
 
-                            if let (Ok(k), Ok(v)) = (cat_k, cat_v) {
-                                let total_len = k.dim(2).unwrap_or(0);
-                                composite_cache[layer_idx] =
-                                    Some(crate::pipeline::KvCache::Normal {
-                                        k: crate::kv_cache::SingleCache {
-                                            all_data: Some(k),
-                                            dim: 2,
-                                            current_seq_len: total_len,
-                                            max_seq_len: usize::MAX,
-                                            capacity_seq_len: total_len,
-                                        },
-                                        v: crate::kv_cache::SingleCache {
-                                            all_data: Some(v),
-                                            dim: 2,
-                                            current_seq_len: total_len,
-                                            max_seq_len: usize::MAX,
-                                            capacity_seq_len: total_len,
-                                        },
-                                    });
+                            let assembled_k = candle_core::Tensor::zeros(
+                                k_shape, first_k.dtype(), first_k.device(),
+                            );
+                            let assembled_v = candle_core::Tensor::zeros(
+                                v_shape, first_v.dtype(), first_v.device(),
+                            );
+
+                            if let (Ok(k_out), Ok(v_out)) = (assembled_k, assembled_v) {
+                                let mut offset = 0usize;
+                                let mut ok = true;
+                                for (k_part, v_part) in &parts {
+                                    if k_out.slice_set(k_part, 2, offset).is_err()
+                                        || v_out.slice_set(v_part, 2, offset).is_err()
+                                    {
+                                        ok = false;
+                                        break;
+                                    }
+                                    offset += k_part.dim(2).unwrap_or(0);
+                                }
+                                if ok {
+                                    composite_cache[layer_idx] =
+                                        Some(crate::pipeline::KvCache::Normal {
+                                            k: crate::kv_cache::SingleCache {
+                                                all_data: Some(k_out),
+                                                dim: 2,
+                                                current_seq_len: total_len,
+                                                max_seq_len: usize::MAX,
+                                                capacity_seq_len: total_len,
+                                            },
+                                            v: crate::kv_cache::SingleCache {
+                                                all_data: Some(v_out),
+                                                dim: 2,
+                                                current_seq_len: total_len,
+                                                max_seq_len: usize::MAX,
+                                                capacity_seq_len: total_len,
+                                            },
+                                        });
+                                }
                             }
                         }
                     }
 
-                    let pic_ctx = pic::PicContext::new(pic_blocks);
+                    let mut pic_ctx = pic::PicContext::new(pic_blocks);
+                    pic_ctx.has_pre_roped_k = all_have_roped_k;
                     let remaining_toks: Vec<u32> = seq
                         .get_toks()
                         .iter()

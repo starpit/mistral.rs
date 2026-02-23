@@ -92,6 +92,17 @@ pub trait NormalModel: IsqModel + AnyMoeBaseModelMixin {
         )
     }
 
+    /// Apply RoPE to K tensor for positions `0..block_len`.
+    /// Used by PIC to pre-compute RoPE'd K at cache save time.
+    /// Returns `None` if the model doesn't support pre-RoPE (default).
+    fn pic_pre_rope_k(
+        &self,
+        _k: &Tensor,
+        _block_len: usize,
+    ) -> candle_core::Result<Option<Tensor>> {
+        Ok(None)
+    }
+
     fn is_xlora(&self) -> bool;
     fn device(&self) -> &Device;
     fn cache(&self) -> &EitherCache;

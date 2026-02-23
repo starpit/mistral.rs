@@ -228,7 +228,24 @@ pub(crate) async fn finish_or_add_toks_to_seq(
                                         })
                                     })
                                     .collect();
-                                prefix_cacher.add_pic_block(hash, block_cache);
+                                // Pre-compute RoPE'd K for this block (positions 0..block_len).
+                                // On cache reuse, the forward pass can skip re-RoPE for these.
+                                let roped_k_vec: Vec<Option<candle_core::Tensor>> = block_cache
+                                    .iter()
+                                    .map(|layer| {
+                                        layer.as_ref().and_then(|kv| {
+                                            kv.k().ok().flatten().and_then(|k| {
+                                                this.pic_pre_rope_k(&k, block.len).ok().flatten()
+                                            })
+                                        })
+                                    })
+                                    .collect();
+                                let roped_k = if roped_k_vec.iter().any(|x| x.is_some()) {
+                                    Some(roped_k_vec)
+                                } else {
+                                    None
+                                };
+                                prefix_cacher.add_pic_block(hash, block_cache, roped_k);
                             }
                         }
                     }

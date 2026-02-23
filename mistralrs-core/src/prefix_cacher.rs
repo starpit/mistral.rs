@@ -6,6 +6,9 @@ use tracing::info;
 
 use crate::{pipeline::KvCache, sequence::Sequence};
 
+/// Result of a PIC block cache lookup: (raw KV cache, optional pre-RoPE'd K per layer).
+pub type PicBlockSearchResult = (Vec<Option<KvCache>>, Option<Vec<Option<candle_core::Tensor>>>);
+
 #[derive(PartialEq, Eq, Debug, Hash)]
 struct Tokens(Vec<u32>);
 
@@ -33,10 +36,20 @@ struct CacheElement {
     image_hashes: Option<Vec<u64>>,
 }
 
+/// PIC block cache entry storing raw KV cache plus optional pre-RoPE'd K.
+#[derive(Clone)]
+struct PicCacheElement {
+    cache: Vec<Option<KvCache>>,
+    /// Pre-RoPE'd K tensors (one per layer). When present, the K tensors
+    /// have RoPE pre-applied for positions 0..block_len, allowing the
+    /// forward pass to skip re-RoPE-ing cached Plus tokens.
+    roped_k: Option<Vec<Option<candle_core::Tensor>>>,
+}
+
 pub struct PrefixCacheManagerV2 {
     caches: IndexMap<Tokens, CacheElement>,
     /// PIC block cache keyed by text content hash (position-independent).
-    pic_blocks: IndexMap<u64, CacheElement>,
+    pic_blocks: IndexMap<u64, PicCacheElement>,
     n_on_device: usize,
     no_prefix_cache: bool,
     has_paged_attention: bool,
@@ -275,17 +288,20 @@ impl PrefixCacheManagerV2 {
     /// this matches by text content hash alone, enabling position-independent reuse.
     /// The hash should be computed via `pic::content_hash_text()` from the original
     /// message text — NOT from token IDs (which are position-dependent due to BPE).
+    ///
+    /// Returns `(cache, roped_k)` where `roped_k` contains pre-RoPE'd K tensors
+    /// if available (one per layer).
     pub fn search_for_pic_block(
         &self,
         _block_tokens: &[u32],
         content_hash: u64,
-    ) -> Result<Option<Vec<Option<KvCache>>>> {
+    ) -> Result<Option<PicBlockSearchResult>> {
         if self.no_prefix_cache {
             return Ok(None);
         }
 
         if let Some(entry) = self.pic_blocks.get(&content_hash) {
-            return Ok(Some(entry.cache.clone()));
+            return Ok(Some((entry.cache.clone(), entry.roped_k.clone())));
         }
 
         Ok(None)
@@ -294,11 +310,13 @@ impl PrefixCacheManagerV2 {
     /// Add a PIC block's KV cache keyed by text content hash.
     ///
     /// The `content_hash` should be computed via `pic::content_hash_text()` from
-    /// the original message text.
+    /// the original message text. `roped_k` contains optional pre-RoPE'd K tensors
+    /// (one per layer) for positions 0..block_len.
     pub fn add_pic_block(
         &mut self,
         content_hash: u64,
         cache: Vec<Option<KvCache>>,
+        roped_k: Option<Vec<Option<candle_core::Tensor>>>,
     ) {
         if self.no_prefix_cache {
             return;
@@ -306,11 +324,7 @@ impl PrefixCacheManagerV2 {
 
         self.pic_blocks.insert(
             content_hash,
-            CacheElement {
-                cache,
-                image_hashes: None,
-                audio_hashes: None,
-            },
+            PicCacheElement { cache, roped_k },
         );
     }
 }

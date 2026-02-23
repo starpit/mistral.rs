@@ -76,6 +76,10 @@ pub struct PicContext {
     pub position_ids: Vec<usize>,
     /// Total sequence length covered by these blocks.
     pub total_len: usize,
+    /// When true, the K tensors for cached Plus blocks are already RoPE'd
+    /// (positions 0..block_len). The forward pass should only apply RoPE to
+    /// new (non-cached) tokens, not the entire cache.
+    pub has_pre_roped_k: bool,
 }
 
 impl PicContext {
@@ -126,6 +130,7 @@ impl PicContext {
             blocks,
             position_ids,
             total_len,
+            has_pre_roped_k: false,
         }
     }
 

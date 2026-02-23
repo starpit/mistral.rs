@@ -1144,6 +1144,14 @@ impl MetadataMixin for NormalPipeline {
 
 #[async_trait::async_trait]
 impl Pipeline for NormalPipeline {
+    fn pic_pre_rope_k(
+        &self,
+        k: &candle_core::Tensor,
+        block_len: usize,
+    ) -> Result<Option<candle_core::Tensor>, candle_core::Error> {
+        self.model.pic_pre_rope_k(k, block_len)
+    }
+
     fn forward_inputs(
         &mut self,
         inputs: Box<dyn Any>,

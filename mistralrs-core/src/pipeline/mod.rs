@@ -430,6 +430,17 @@ pub trait Pipeline:
         return_raw_logits: bool,
     ) -> Result<ForwardInputsResult, candle_core::Error>;
 
+    /// Apply RoPE to K tensor for positions `0..block_len`.
+    /// Used by PIC to pre-compute RoPE'd K at cache save time.
+    /// Returns `None` if the model doesn't support pre-RoPE (default).
+    fn pic_pre_rope_k(
+        &self,
+        _k: &Tensor,
+        _block_len: usize,
+    ) -> Result<Option<Tensor>, candle_core::Error> {
+        Ok(None)
+    }
+
     /// Returns the total of model execution time.
     #[allow(clippy::too_many_arguments)]
     async fn step(

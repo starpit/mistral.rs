@@ -1050,6 +1050,12 @@ impl Llama3RotaryEmbedding {
         self.0
             .forward_per_token(q, k, q_positions, k_positions)
     }
+
+    /// Apply RoPE to K only (no Q). Used by PIC to pre-compute RoPE'd K at
+    /// cache save time so that reuse avoids re-RoPE-ing the entire cache.
+    pub fn forward_k_only(&self, k: &Tensor, k_positions: &[usize]) -> Result<Tensor> {
+        self.0.forward_k_only(k, k_positions)
+    }
 }
 
 /// RoPE for SmolLm3
@@ -2373,11 +2379,22 @@ impl RotaryEmbedding {
         if positions.is_empty() {
             return Tensor::zeros((0, table.dim(1)?), table.dtype(), table.device());
         }
-        let indices: Vec<Tensor> = positions
-            .iter()
-            .map(|&pos| table.narrow(0, pos, 1))
-            .collect::<Result<Vec<_>>>()?;
-        Tensor::cat(&indices, 0)
+        let idx_data: Vec<u32> = positions.iter().map(|&p| p as u32).collect();
+        let idx = Tensor::from_vec(idx_data, (positions.len(),), table.device())?;
+        table.index_select(&idx, 0)
+    }
+
+    /// Apply RoPE to K only (no Q). Used by PIC to pre-compute RoPE'd K at
+    /// cache save time so that reuse avoids re-RoPE-ing the entire cache.
+    fn forward_k_only(&self, k: &Tensor, k_positions: &[usize]) -> Result<Tensor> {
+        let rope = if self.is_gpt_neox {
+            candle_nn::rotary_emb::rope
+        } else {
+            candle_nn::rotary_emb::rope_i
+        };
+        let k_cos = self.gather_positions(&self.cos, k_positions)?;
+        let k_sin = self.gather_positions(&self.sin, k_positions)?;
+        rope(&k.contiguous()?, &k_cos, &k_sin)
     }
 }
 
