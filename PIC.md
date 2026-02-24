@@ -1,5 +1,17 @@
 # Position-Independent Caching (PIC) — Engine Internals
 
+## Summary
+
+**Full deferred-RoPE support (exact results):** Llama, Qwen2, Qwen3, Qwen3 MoE, Qwen3 Next, Mistral, Mixtral, Gemma, Gemma 2, StarCoder2, Phi-2, Phi-3/4, Phi-3.5 MoE, SmolLM3, Granite, GPT-OSS -- plus GGUF variants of Llama, Qwen2, Qwen3, Qwen3 MoE, StarCoder2.
+
+**Approximate cache reuse (no deferred RoPE):** GGUF Phi-2, GGUF Phi-3 (custom cos/sin RoPE), XLoRA models, GLM-4. Cache infrastructure still fires -- real TTFT speedup, but K tensors have wrong positional encoding at new positions.
+
+**No support:** Vision model text backbones, DeepSeek V2/V3 (MLA attention; PicRope trait implemented, model wiring pending).
+
+**Diff:** +1082 lines in new file (`pic.rs`), +2906/-374 lines across 53 existing files, +202 lines docs.
+
+---
+
 PIC enables KV cache reuse for content blocks that appear at different positions across requests. Standard transformer KV caches store RoPE-encoded K tensors, making cache entries position-dependent. PIC stores un-rotated K for designated "Plus" blocks and applies RoPE at attention time, making those cache entries relocatable. This is the engine-level implementation; see the root `README_PIC.md` for spnl query syntax, benchmarking, and usage.
 
 ## Deferred RoPE
