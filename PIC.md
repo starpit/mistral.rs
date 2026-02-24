@@ -2,7 +2,7 @@
 
 ## Summary
 
-**Full deferred-RoPE support (exact results):** Llama, Qwen2, Qwen3, Qwen3 MoE, Qwen3 Next, Mistral, Mixtral, Gemma, Gemma 2, StarCoder2, Phi-2, Phi-3/4, Phi-3.5 MoE, SmolLM3, Granite, GPT-OSS -- plus GGUF variants of Llama, Qwen2, Qwen3, Qwen3 MoE, StarCoder2.
+**Full deferred-RoPE support:** Llama, Qwen2, Qwen3, Qwen3 MoE, Qwen3 Next, Mistral, Mixtral, Gemma, Gemma 2, StarCoder2, Phi-2, Phi-3/4, Phi-3.5 MoE, SmolLM3, Granite, GPT-OSS -- plus GGUF variants of Llama, Qwen2, Qwen3, Qwen3 MoE, StarCoder2.
 
 **Approximate cache reuse (no deferred RoPE):** GGUF Phi-2, GGUF Phi-3 (custom cos/sin RoPE), XLoRA models, GLM-4. Cache infrastructure still fires -- real TTFT speedup, but K tensors have wrong positional encoding at new positions.
 
@@ -146,7 +146,7 @@ However, the cached K tensors retain **position-dependent RoPE encoding** from t
 
 ### Not yet supported (deferred RoPE)
 
-The following model types lack deferred RoPE, so PIC cache reuse is approximate (see above) rather than exact:
+The following model types lack deferred RoPE, so PIC cache reuse is approximate (see above) — cached K has incorrect positional encoding at new positions:
 
 - **GGUF Phi-2**: Custom partial RoPE with raw cos/sin tensors (not `RotaryEmbedding`)
 - **GGUF Phi-3**: Custom long/short RoPE implementation (not `PhiRotaryEmbedding`)
