@@ -520,30 +520,35 @@ pub fn detect_pic_blocks(tokens: &[u32], plus_token: u32, cross_token: u32) -> O
 mod tests {
     use super::*;
 
+    // -----------------------------------------------------------------------
+    // Helper to build blocks concisely
+    // -----------------------------------------------------------------------
+
+    fn cross(start: usize, len: usize) -> PicBlock {
+        PicBlock {
+            start,
+            len,
+            is_plus: false,
+            content_hash: None,
+        }
+    }
+
+    fn plus(start: usize, len: usize) -> PicBlock {
+        PicBlock {
+            start,
+            len,
+            is_plus: true,
+            content_hash: Some(start as u64 * 1000 + len as u64),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // PicContext::new — position ID assignment
+    // -----------------------------------------------------------------------
+
     #[test]
     fn test_pic_context_positions() {
-        let blocks = vec![
-            PicBlock {
-                start: 0,
-                len: 5,
-                is_plus: false,
-                content_hash: None,
-            },
-            PicBlock {
-                start: 5,
-                len: 3,
-                is_plus: true,
-                content_hash: Some(123),
-            },
-            PicBlock {
-                start: 8,
-                len: 2,
-                is_plus: false,
-                content_hash: None,
-            },
-        ];
-
-        let ctx = PicContext::new(blocks);
+        let ctx = PicContext::new(vec![cross(0, 5), plus(5, 3), cross(8, 2)]);
 
         // Cross block: positions 0..5
         assert_eq!(ctx.position_ids[0], 0);
@@ -554,35 +559,347 @@ mod tests {
         assert_eq!(ctx.position_ids[6], 1);
         assert_eq!(ctx.position_ids[7], 2);
 
-        // Second cross block: continues from 5
+        // Second cross block: continues from 5 (skipping Plus tokens)
         assert_eq!(ctx.position_ids[8], 5);
         assert_eq!(ctx.position_ids[9], 6);
     }
 
     #[test]
-    fn test_pic_context_is_plus() {
-        let blocks = vec![
-            PicBlock {
-                start: 0,
-                len: 3,
-                is_plus: false,
-                content_hash: None,
-            },
-            PicBlock {
-                start: 3,
-                len: 4,
-                is_plus: true,
-                content_hash: Some(42),
-            },
-        ];
+    fn test_positions_multiple_plus_blocks() {
+        // Cross(3) Plus(2) Cross(1) Plus(4) Cross(2)
+        let ctx = PicContext::new(vec![
+            cross(0, 3),
+            plus(3, 2),
+            cross(5, 1),
+            plus(6, 4),
+            cross(10, 2),
+        ]);
 
-        let ctx = PicContext::new(blocks);
+        // First cross: 0,1,2
+        assert_eq!(&ctx.position_ids[0..3], &[0, 1, 2]);
+        // First plus: local 0,1
+        assert_eq!(&ctx.position_ids[3..5], &[0, 1]);
+        // Middle cross: continues at 3
+        assert_eq!(ctx.position_ids[5], 3);
+        // Second plus: local 0,1,2,3
+        assert_eq!(&ctx.position_ids[6..10], &[0, 1, 2, 3]);
+        // Final cross: continues at 4,5
+        assert_eq!(&ctx.position_ids[10..12], &[4, 5]);
+    }
+
+    #[test]
+    fn test_positions_plus_at_start() {
+        let ctx = PicContext::new(vec![plus(0, 4), cross(4, 3)]);
+
+        // Plus block: local 0..4
+        assert_eq!(&ctx.position_ids[0..4], &[0, 1, 2, 3]);
+        // Cross starts at 0 (no prior cross tokens)
+        assert_eq!(&ctx.position_ids[4..7], &[0, 1, 2]);
+    }
+
+    #[test]
+    fn test_positions_gap_between_blocks() {
+        // Blocks don't cover indices 3,4 — simulates chat template tokens
+        let ctx = PicContext::new(vec![cross(0, 3), plus(5, 3), cross(8, 2)]);
+
+        assert_eq!(ctx.total_len, 10);
+        // Gap tokens (3,4) are treated as cross
+        assert_eq!(&ctx.position_ids[0..3], &[0, 1, 2]);
+        assert_eq!(&ctx.position_ids[3..5], &[3, 4]); // gap = cross
+        assert_eq!(&ctx.position_ids[5..8], &[0, 1, 2]); // plus = local
+        assert_eq!(&ctx.position_ids[8..10], &[5, 6]); // cross continues
+    }
+
+    #[test]
+    fn test_positions_empty_blocks() {
+        let ctx = PicContext::new(vec![]);
+        assert_eq!(ctx.total_len, 0);
+        assert!(ctx.position_ids.is_empty());
+    }
+
+    #[test]
+    fn test_positions_only_plus() {
+        let ctx = PicContext::new(vec![plus(0, 5)]);
+        assert_eq!(&ctx.position_ids[..], &[0, 1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn test_positions_adjacent_plus_blocks() {
+        // Two plus blocks back to back — each gets local positions
+        let ctx = PicContext::new(vec![plus(0, 3), plus(3, 2)]);
+
+        assert_eq!(&ctx.position_ids[0..3], &[0, 1, 2]);
+        assert_eq!(&ctx.position_ids[3..5], &[0, 1]);
+    }
+
+    // -----------------------------------------------------------------------
+    // PicContext::is_plus_token
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_pic_context_is_plus() {
+        let ctx = PicContext::new(vec![cross(0, 3), plus(3, 4)]);
 
         assert!(!ctx.is_plus_token(0));
         assert!(!ctx.is_plus_token(2));
         assert!(ctx.is_plus_token(3));
         assert!(ctx.is_plus_token(6));
     }
+
+    #[test]
+    fn test_is_plus_token_beyond_blocks() {
+        let ctx = PicContext::new(vec![cross(0, 3)]);
+        // Index beyond all blocks should not be Plus
+        assert!(!ctx.is_plus_token(5));
+    }
+
+    // -----------------------------------------------------------------------
+    // PicContext::block_for_token
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_block_for_token() {
+        let ctx = PicContext::new(vec![cross(0, 3), plus(3, 2), cross(5, 1)]);
+
+        assert_eq!(ctx.block_for_token(0), Some(0));
+        assert_eq!(ctx.block_for_token(2), Some(0));
+        assert_eq!(ctx.block_for_token(3), Some(1));
+        assert_eq!(ctx.block_for_token(4), Some(1));
+        assert_eq!(ctx.block_for_token(5), Some(2));
+    }
+
+    #[test]
+    fn test_block_for_token_in_gap() {
+        // Gap at index 3,4
+        let ctx = PicContext::new(vec![cross(0, 3), plus(5, 2)]);
+        assert_eq!(ctx.block_for_token(3), None);
+        assert_eq!(ctx.block_for_token(4), None);
+    }
+
+    #[test]
+    fn test_block_for_token_beyond_all() {
+        let ctx = PicContext::new(vec![cross(0, 3)]);
+        assert_eq!(ctx.block_for_token(10), None);
+    }
+
+    // -----------------------------------------------------------------------
+    // PicContext::make_pic_mask
+    // -----------------------------------------------------------------------
+
+    /// Extract the raw f32 mask values from a mask tensor for inspection.
+    fn mask_to_vec(mask: &Tensor) -> Vec<f32> {
+        mask.to_dtype(DType::F32)
+            .unwrap()
+            .to_vec2::<f32>()
+            .unwrap()
+            .into_iter()
+            .flatten()
+            .collect()
+    }
+
+    fn attends(val: f32) -> bool {
+        val == 0.0
+    }
+
+    fn blocked(val: f32) -> bool {
+        val.is_infinite() && val.is_sign_negative()
+    }
+
+    #[test]
+    fn test_make_pic_mask_basic_rules() {
+        // Layout: Cross(3) Plus_A(2) Plus_B(2) Cross(1)
+        // Indices: 0 1 2 | 3 4 | 5 6 | 7
+        let ctx = PicContext::new(vec![cross(0, 3), plus(3, 2), plus(5, 2), cross(7, 1)]);
+
+        let mask = ctx
+            .make_pic_mask(8, 0, &Device::Cpu, DType::F32)
+            .unwrap();
+        let vals = mask_to_vec(&mask);
+        let n = 8;
+        let at = |q: usize, k: usize| vals[q * n + k];
+
+        // Cross -> Cross: standard causal
+        assert!(attends(at(0, 0))); // token 0 sees itself
+        assert!(blocked(at(0, 1))); // token 0 doesn't see future
+        assert!(attends(at(2, 0))); // token 2 sees token 0
+        assert!(attends(at(2, 2))); // token 2 sees itself
+
+        // Plus_A -> Cross: sees cross tokens before Plus_A's block start (0,1,2)
+        assert!(attends(at(3, 0)));
+        assert!(attends(at(3, 2)));
+        assert!(attends(at(4, 0)));
+
+        // Plus_A -> Plus_A: causal within block
+        assert!(attends(at(3, 3))); // first token of A sees itself
+        assert!(attends(at(4, 3))); // second token of A sees first
+        assert!(attends(at(4, 4))); // second token sees itself
+
+        // Plus_A -> Plus_B: blocked (different Plus blocks)
+        assert!(blocked(at(3, 5)));
+        assert!(blocked(at(4, 6)));
+
+        // Plus_B -> Plus_A: blocked
+        assert!(blocked(at(5, 3)));
+        assert!(blocked(at(6, 4)));
+
+        // Plus_B -> Plus_B: causal within block
+        assert!(attends(at(5, 5)));
+        assert!(attends(at(6, 5)));
+        assert!(attends(at(6, 6)));
+
+        // Plus_B -> Cross: sees cross tokens before Plus_B's start (0,1,2)
+        assert!(attends(at(5, 0)));
+        assert!(attends(at(5, 2)));
+        // Plus_B should NOT see the cross tokens at Plus_A's positions
+        // (those are Plus, not Cross, so this is Plus->Plus cross-block)
+        assert!(blocked(at(5, 3)));
+
+        // Cross(7) -> Plus: cross after Plus can see Plus tokens
+        assert!(attends(at(7, 3))); // sees Plus_A
+        assert!(attends(at(7, 5))); // sees Plus_B
+        assert!(attends(at(7, 7))); // sees itself
+
+        // Cross(7) -> Cross: causal
+        assert!(attends(at(7, 0)));
+        assert!(attends(at(7, 2)));
+    }
+
+    #[test]
+    fn test_make_pic_mask_with_past_kv() {
+        // past_kv_len=2, so q indices start at 2 in the context
+        // Layout: Cross(2) [past] | Plus(2) Cross(1) [new]
+        let ctx = PicContext::new(vec![cross(0, 2), plus(2, 2), cross(4, 1)]);
+
+        let tgt_len = 3; // tokens 2,3,4 are new
+        let past_kv_len = 2;
+        let mask = ctx
+            .make_pic_mask(tgt_len, past_kv_len, &Device::Cpu, DType::F32)
+            .unwrap();
+        let vals = mask_to_vec(&mask);
+        let full_len = tgt_len + past_kv_len; // 5
+        let at = |q: usize, k: usize| vals[q * full_len + k];
+
+        // q=0 is token index 2 (Plus), q=1 is token 3 (Plus), q=2 is token 4 (Cross)
+        // Plus(idx=2) -> Cross(idx=0): should attend (cross before plus block)
+        assert!(attends(at(0, 0)));
+        assert!(attends(at(0, 1)));
+        // Plus(idx=2) -> Plus(idx=2): attend (same block, self)
+        assert!(attends(at(0, 2)));
+
+        // Cross(idx=4) -> all prior: attends
+        assert!(attends(at(2, 0)));
+        assert!(attends(at(2, 4)));
+    }
+
+    #[test]
+    fn test_make_pic_mask_shape() {
+        let ctx = PicContext::new(vec![cross(0, 4), plus(4, 3)]);
+        let mask = ctx
+            .make_pic_mask(7, 0, &Device::Cpu, DType::F32)
+            .unwrap();
+        assert_eq!(mask.dims(), &[7, 7]);
+
+        let mask_past = ctx
+            .make_pic_mask(3, 4, &Device::Cpu, DType::F32)
+            .unwrap();
+        assert_eq!(mask_past.dims(), &[3, 7]);
+    }
+
+    // -----------------------------------------------------------------------
+    // compute_pic_rope_positions
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_compute_pic_rope_positions_no_past() {
+        let ctx = PicContext::new(vec![cross(0, 3), plus(3, 2), cross(5, 2)]);
+        let (q_pos, k_pos) = compute_pic_rope_positions(&ctx, 7, 0);
+
+        // Q positions = position_ids[0..7]
+        assert_eq!(q_pos, ctx.position_ids);
+        // K positions = same (no past)
+        assert_eq!(k_pos, ctx.position_ids);
+    }
+
+    #[test]
+    fn test_compute_pic_rope_positions_with_past() {
+        let ctx = PicContext::new(vec![cross(0, 3), plus(3, 2), cross(5, 2)]);
+
+        // Simulating: past_kv_len=3 (cross tokens cached), seq_len=4 (processing rest)
+        let (q_pos, k_pos) = compute_pic_rope_positions(&ctx, 4, 3);
+
+        // Q covers indices 3..7 → position_ids[3..7]
+        assert_eq!(q_pos, &ctx.position_ids[3..7]);
+        // K covers indices 0..7 → position_ids[0..7]
+        assert_eq!(k_pos, ctx.position_ids);
+    }
+
+    #[test]
+    fn test_compute_pic_rope_positions_beyond_context() {
+        // When indices exceed position_ids, falls back to identity
+        let ctx = PicContext::new(vec![cross(0, 3)]);
+
+        let (q_pos, k_pos) = compute_pic_rope_positions(&ctx, 2, 3);
+
+        // Q covers indices 3,4 — both beyond position_ids (len=3), so fallback
+        assert_eq!(q_pos, vec![3, 4]);
+        // K covers 0..5 — first 3 from position_ids, rest fallback
+        assert_eq!(k_pos, vec![0, 1, 2, 3, 4]);
+    }
+
+    // -----------------------------------------------------------------------
+    // content_hash_text
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_content_hash_text_deterministic() {
+        let h1 = content_hash_text("The capital of France is Paris");
+        let h2 = content_hash_text("The capital of France is Paris");
+        assert_eq!(h1, h2);
+    }
+
+    #[test]
+    fn test_content_hash_text_differs_for_different_content() {
+        let h1 = content_hash_text("Document A");
+        let h2 = content_hash_text("Document B");
+        assert_ne!(h1, h2);
+    }
+
+    #[test]
+    fn test_content_hash_text_empty() {
+        // Empty string should still produce a valid hash
+        let h = content_hash_text("");
+        // Just verify it doesn't panic and returns something
+        let _ = h;
+    }
+
+    // -----------------------------------------------------------------------
+    // content_hash_tokens
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_content_hash_tokens_deterministic() {
+        let h1 = content_hash_tokens(&[10, 20, 30]);
+        let h2 = content_hash_tokens(&[10, 20, 30]);
+        assert_eq!(h1, h2);
+    }
+
+    #[test]
+    fn test_content_hash_tokens_differs_for_different_content() {
+        let h1 = content_hash_tokens(&[10, 20, 30]);
+        let h2 = content_hash_tokens(&[10, 20, 31]);
+        assert_ne!(h1, h2);
+    }
+
+    #[test]
+    fn test_content_hash_tokens_order_matters() {
+        let h1 = content_hash_tokens(&[10, 20]);
+        let h2 = content_hash_tokens(&[20, 10]);
+        assert_ne!(h1, h2);
+    }
+
+    // -----------------------------------------------------------------------
+    // DeferredRopeMap
+    // -----------------------------------------------------------------------
 
     #[test]
     fn test_deferred_rope_map() {
@@ -598,8 +915,28 @@ mod tests {
     }
 
     #[test]
+    fn test_deferred_rope_map_no_deferred() {
+        let mut map = DeferredRopeMap::new();
+        map.extend(&[false, false, false], &[0, 1, 2]);
+        assert!(!map.has_deferred());
+        assert_eq!(map.len(), 3);
+    }
+
+    #[test]
+    fn test_deferred_rope_map_multiple_extends() {
+        let mut map = DeferredRopeMap::new();
+        map.extend(&[false], &[0]);
+        map.extend(&[true, true], &[0, 1]);
+        assert!(map.has_deferred());
+        assert_eq!(map.len(), 3);
+    }
+
+    // -----------------------------------------------------------------------
+    // detect_pic_blocks — edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
     fn test_detect_pic_blocks_no_sentinels() {
-        // No sentinel tokens -> None
         assert!(detect_pic_blocks(&[1, 2, 3, 4], 100, 101).is_none());
     }
 
@@ -611,19 +948,16 @@ mod tests {
 
         assert_eq!(blocks.len(), 3);
 
-        // First cross block: tokens [10, 11] at positions 1..3
         assert_eq!(blocks[0].start, 1);
         assert_eq!(blocks[0].len, 2);
         assert!(!blocks[0].is_plus);
         assert!(blocks[0].content_hash.is_none());
 
-        // Plus block: tokens [20, 21, 22] at positions 4..7
         assert_eq!(blocks[1].start, 4);
         assert_eq!(blocks[1].len, 3);
         assert!(blocks[1].is_plus);
         assert!(blocks[1].content_hash.is_some());
 
-        // Second cross block: token [30] at position 8
         assert_eq!(blocks[2].start, 8);
         assert_eq!(blocks[2].len, 1);
         assert!(!blocks[2].is_plus);
@@ -635,8 +969,114 @@ mod tests {
         let tokens_b = vec![100, 20, 21, 22];
         let blocks_a = detect_pic_blocks(&tokens_a, 100, 101).unwrap();
         let blocks_b = detect_pic_blocks(&tokens_b, 100, 101).unwrap();
-
-        // Same content should produce the same hash
         assert_eq!(blocks_a[0].content_hash, blocks_b[0].content_hash);
+    }
+
+    #[test]
+    fn test_detect_pic_blocks_tokens_before_sentinel() {
+        // Tokens 1,2,3 appear before any sentinel — should be treated as Cross
+        let tokens = vec![1, 2, 3, 100, 10, 11];
+        let blocks = detect_pic_blocks(&tokens, 100, 101).unwrap();
+
+        assert_eq!(blocks.len(), 2);
+        // Pre-sentinel tokens: Cross
+        assert_eq!(blocks[0].start, 0);
+        assert_eq!(blocks[0].len, 3);
+        assert!(!blocks[0].is_plus);
+        // After plus sentinel
+        assert_eq!(blocks[1].start, 4);
+        assert_eq!(blocks[1].len, 2);
+        assert!(blocks[1].is_plus);
+    }
+
+    #[test]
+    fn test_detect_pic_blocks_consecutive_sentinels() {
+        // Two sentinels in a row: plus then cross — empty plus block is skipped
+        let tokens = vec![100, 101, 10, 11];
+        let blocks = detect_pic_blocks(&tokens, 100, 101).unwrap();
+
+        // The plus sentinel at 0 starts a block at 1, but cross sentinel at 1
+        // closes it immediately (len=0), so it's skipped.
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].start, 2);
+        assert!(!blocks[0].is_plus);
+    }
+
+    #[test]
+    fn test_detect_pic_blocks_sentinel_at_end() {
+        // Sentinel as the very last token — no content after it
+        let tokens = vec![101, 10, 11, 100];
+        let blocks = detect_pic_blocks(&tokens, 100, 101).unwrap();
+
+        // Only the cross block [10, 11] should appear
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].start, 1);
+        assert_eq!(blocks[0].len, 2);
+        assert!(!blocks[0].is_plus);
+    }
+
+    #[test]
+    fn test_detect_pic_blocks_only_plus() {
+        let tokens = vec![100, 10, 20, 30];
+        let blocks = detect_pic_blocks(&tokens, 100, 101).unwrap();
+
+        assert_eq!(blocks.len(), 1);
+        assert!(blocks[0].is_plus);
+        assert_eq!(blocks[0].start, 1);
+        assert_eq!(blocks[0].len, 3);
+    }
+
+    #[test]
+    fn test_detect_pic_blocks_multiple_plus() {
+        // plus(10,11) plus(20,21)
+        let tokens = vec![100, 10, 11, 100, 20, 21];
+        let blocks = detect_pic_blocks(&tokens, 100, 101).unwrap();
+
+        assert_eq!(blocks.len(), 2);
+        assert!(blocks[0].is_plus);
+        assert_eq!(blocks[0].start, 1);
+        assert_eq!(blocks[0].len, 2);
+        assert!(blocks[1].is_plus);
+        assert_eq!(blocks[1].start, 4);
+        assert_eq!(blocks[1].len, 2);
+
+        // Different content → different hashes
+        assert_ne!(blocks[0].content_hash, blocks[1].content_hash);
+    }
+
+    #[test]
+    fn test_detect_pic_blocks_empty_input() {
+        assert!(detect_pic_blocks(&[], 100, 101).is_none());
+    }
+
+    #[test]
+    fn test_detect_pic_blocks_only_sentinel() {
+        // A single sentinel with no content produces no blocks
+        let tokens = vec![100];
+        let blocks = detect_pic_blocks(&tokens, 100, 101);
+        assert!(blocks.is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // Cache stats counters
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_cache_stats_record_and_reset() {
+        // Reset any prior state
+        let _ = take_cache_stats();
+
+        record_cache_hit();
+        record_cache_hit();
+        record_cache_miss();
+
+        let (hits, misses) = take_cache_stats();
+        assert_eq!(hits, 2);
+        assert_eq!(misses, 1);
+
+        // After take, counters should be reset
+        let (hits, misses) = take_cache_stats();
+        assert_eq!(hits, 0);
+        assert_eq!(misses, 0);
     }
 }
