@@ -541,7 +541,7 @@ impl Pipeline for GGMLPipeline {
         } = *inputs.downcast().expect("Downcast failed.");
         let logits = match self.model {
             Model::Llama(ref model) => {
-                model.forward(&input_ids, &seqlen_offsets, context_lens, None)?
+                model.forward(&input_ids, &seqlen_offsets, context_lens, None, &flash_meta, None)?
             }
             Model::XLoraLlama(ref model) => model.forward(
                 &input_ids,

@@ -13,8 +13,10 @@ use crate::attention::SdpaParams;
 use crate::device_map::{DeviceMappedMask, DeviceMapper};
 use crate::gguf::Content;
 use crate::layers::{CausalMasker, MatMul, QRmsNorm, RotaryEmbedding, Sdpa};
+use crate::pipeline::text_models_inputs_processor::FlashParams;
 use crate::layers_masker::PastKvLenCache;
 use crate::paged_attention::{AttentionImplementation, PagedAttention};
+use crate::pic::{self, PicContext};
 use crate::pipeline::extract_logits;
 use crate::pipeline::text_models_inputs_processor::PagedAttentionInputMetadata;
 use crate::pipeline::EitherCache;
@@ -145,6 +147,8 @@ impl LayerWeights {
         start_offsets: &[usize],
         kv_cache: &mut KvCache,
         metadata: Option<((Tensor, Tensor), &PagedAttentionInputMetadata)>,
+        flash_params: &FlashParams,
+        pic_context: Option<&PicContext>,
     ) -> Result<Tensor> {
         let (b_sz, seq_len, _) = x.dims3()?;
 
@@ -175,6 +179,23 @@ impl LayerWeights {
             let v = v.reshape((b_sz, self.n_kv_head, seq_len, self.head_dim))?;
             (q, k, v)
         };
+
+        // PIC path: deferred RoPE via shared helper
+        if let Some(pic_ctx) = pic_context {
+            if self.paged_attn.is_some() {
+                candle_core::bail!("PIC is not supported with paged attention");
+            }
+            let y = pic::pic_sdpa_attention(
+                &q, &k, &v, pic_ctx, &*self.rotary, kv_cache,
+                mask, flash_params, &self.sdpa_params,
+            )?;
+            let y = if mask.is_some() {
+                y.transpose(1, 2)?.reshape((b_sz, seq_len, ()))?
+            } else {
+                y.reshape((b_sz, seq_len, ()))?
+            };
+            return MatMul.qmethod_matmul(&y.to_dtype(x.dtype())?, &*self.attention_wo);
+        }
 
         let (q, k) = self.rotary.forward(&q, &k, start_offsets)?;
 
@@ -664,25 +685,39 @@ impl ModelWeights {
         start_offsets: &[usize],
         context_lens: Vec<(usize, usize)>,
         metadata: Option<(Vec<(Tensor, Tensor)>, &PagedAttentionInputMetadata)>,
+        flash_params: &FlashParams,
+        pic_context: Option<&PicContext>,
     ) -> Result<Tensor> {
         let mut layer_in = self.tok_embeddings.forward(x)?;
         let cache = &mut self.cache.normal().0;
-        let mask = CausalMasker.make_causal_mask_matrix(
-            x,
-            metadata
-                .as_ref()
-                .map(|(_, _)| &start_offsets as &dyn PastKvLenCache)
-                .unwrap_or(cache as &dyn PastKvLenCache),
-            self.dtype,
-            self.layers[0].n_head,
-        )?;
-        // PagedAttention prompt chunking
-        let mask = mask.filter(|_| {
-            metadata
-                .as_ref()
-                .map(|(_, meta)| meta.is_first_prompt_chunk)
-                .unwrap_or(true)
-        });
+
+        // When PIC context is present, use block-attention mask instead of causal mask
+        let mask = if let Some(pic_ctx) = pic_context {
+            let (_b_sz, tgt_len) = x.dims2()?;
+            if tgt_len == 1 {
+                None
+            } else {
+                let past_kv_len = cache[0].current_seq_len();
+                Some(pic_ctx.make_pic_mask(tgt_len, past_kv_len, x.device(), self.dtype)?)
+            }
+        } else {
+            let mask = CausalMasker.make_causal_mask_matrix(
+                x,
+                metadata
+                    .as_ref()
+                    .map(|(_, _)| &start_offsets as &dyn PastKvLenCache)
+                    .unwrap_or(cache as &dyn PastKvLenCache),
+                self.dtype,
+                self.layers[0].n_head,
+            )?;
+            // PagedAttention prompt chunking
+            mask.filter(|_| {
+                metadata
+                    .as_ref()
+                    .map(|(_, meta)| meta.is_first_prompt_chunk)
+                    .unwrap_or(true)
+            })
+        };
         let mask = if let Some(ref mapper) = self.mapper {
             DeviceMappedMask::new(mask, &**mapper)?
         } else {
@@ -703,6 +738,8 @@ impl ModelWeights {
                 metadata
                     .as_ref()
                     .map(|(kv_cache, metadata)| (kv_cache[i].clone(), *metadata)),
+                flash_params,
+                pic_context,
             )?;
             let x = (attn + residual)?;
 
@@ -717,5 +754,12 @@ impl ModelWeights {
         let x = self.norm.forward(&layer_in)?;
         let x = extract_logits(&x, context_lens)?;
         MatMul.qmethod_matmul(&x.contiguous()?, &*self.output)
+    }
+
+    pub fn pic_pre_rope_k(&self, k: &Tensor, block_len: usize) -> Result<Option<Tensor>> {
+        use crate::pic::PicRope;
+        let rotary = &*self.layers[0].rotary;
+        let positions: Vec<usize> = (0..block_len).collect();
+        Ok(Some(rotary.pic_forward_k_only(k, &positions)?))
     }
 }

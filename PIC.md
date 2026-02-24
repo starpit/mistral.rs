@@ -118,13 +118,27 @@ Implementations exist for: `RotaryEmbedding`, `Llama3RotaryEmbedding`, `SmolLm3R
 | Granite (MoE Hybrid) | RotaryEmbedding (optional) | Full (nope layers skipped; Mamba layers unaffected) |
 | GPT-OSS | GptOssRotaryEmbeddingVariant | Full (Standard + YARN variants) |
 | DeepSeek V2/V3 | DeepSeekV2RotaryEmbedding | PicRope implemented; model-level wiring pending (MLA attention is structurally different) |
+| **GGUF Llama** | RotaryEmbedding | Full |
+| **GGUF Qwen2** | RotaryEmbedding | Full |
+| **GGUF Qwen3** | RotaryEmbedding | Full |
+| **GGUF Qwen3 MoE** | RotaryEmbedding | Full |
+| **GGUF StarCoder2** | RotaryEmbedding | Full |
 
 Models without explicit PIC support work unchanged — `NormalModel` provides default no-op `forward_pic` (delegates to `forward`) and `pic_pre_rope_k` (returns `None`).
 
-### Not yet supported
+### Cache reuse without deferred RoPE (unsupported models)
 
+The cache save/lookup/assembly infrastructure (`add_request.rs`, `sampling.rs`, `prefix_cacher.rs`) is pipeline-agnostic — it operates on sequences and KV caches, not model internals. Models without deferred RoPE support still benefit from PIC cache reuse: cached Plus block KV entries are loaded and only Cross tokens go through prefill, producing real TTFT speedups.
+
+However, the cached K tensors retain **position-dependent RoPE encoding** from their original positions. When reused at different positions, the RoPE is incorrect — producing **approximate** results (the same trade-off as [CacheBlend](https://arxiv.org/pdf/2405.16444)). For many RAG workloads the positional error is small enough to be unnoticeable, but results are not mathematically identical to a full prefill.
+
+### Not yet supported (deferred RoPE)
+
+The following model types lack deferred RoPE, so PIC cache reuse is approximate (see above) rather than exact:
+
+- **GGUF Phi-2**: Custom partial RoPE with raw cos/sin tensors (not `RotaryEmbedding`)
+- **GGUF Phi-3**: Custom long/short RoPE implementation (not `PhiRotaryEmbedding`)
 - **GLM-4 / GLM-4 MoE**: Custom local RoPE implementation
-- **Quantized models (GGUF)**: Different attention backend
 - **XLoRA models**: Different forward path
 - **Vision model text backbones**: Separate model implementations in `vision_models/`
 

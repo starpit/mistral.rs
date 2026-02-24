@@ -733,6 +733,24 @@ impl MetadataMixin for GGUFPipeline {
 
 #[async_trait::async_trait]
 impl Pipeline for GGUFPipeline {
+    fn pic_pre_rope_k(
+        &self,
+        k: &candle_core::Tensor,
+        block_len: usize,
+    ) -> Result<Option<candle_core::Tensor>, candle_core::Error> {
+        match &self.model {
+            Model::Llama(model) => model.pic_pre_rope_k(k, block_len),
+            Model::Qwen(model) => model.pic_pre_rope_k(k, block_len),
+            Model::Qwen3(model) => model.pic_pre_rope_k(k, block_len),
+            Model::Qwen3MoE(model) => model.pic_pre_rope_k(k, block_len),
+            Model::Starcoder2(model) => model.pic_pre_rope_k(k, block_len),
+            // Phi2, Phi3, XLora: no PIC support yet (custom RoPE implementations)
+            Model::Phi2(_) | Model::Phi3(_) | Model::XLoraLlama(_) | Model::XLoraPhi3(_) => {
+                Ok(None)
+            }
+        }
+    }
+
     fn forward_inputs(
         &mut self,
         inputs: Box<dyn Any>,
@@ -748,7 +766,7 @@ impl Pipeline for GGUFPipeline {
             paged_attn_meta,
             flash_meta,
             flash_meta_full,
-            pic_context: _pic_context,
+            pic_context,
         } = *inputs.downcast().expect("Downcast failed.");
         let metadata = self.get_metadata();
         let paged_attn_meta = match (&metadata.cache_engine, &paged_attn_meta) {
@@ -763,9 +781,10 @@ impl Pipeline for GGUFPipeline {
             }
             (None, None) => None,
         };
+        let pic_ctx_ref = pic_context.as_ref();
         let logits = match self.model {
             Model::Llama(ref model) => {
-                model.forward(&input_ids, &seqlen_offsets, context_lens, paged_attn_meta)?
+                model.forward(&input_ids, &seqlen_offsets, context_lens, paged_attn_meta, &flash_meta, pic_ctx_ref)?
             }
             Model::Phi2(ref model) => {
                 model.forward(&input_ids, &seqlen_offsets, context_lens, paged_attn_meta)?
@@ -796,16 +815,16 @@ impl Pipeline for GGUFPipeline {
                 flash_meta_full.as_ref().unwrap_or(&flash_meta),
             )?,
             Model::Starcoder2(ref model) => {
-                model.forward(&input_ids, &seqlen_offsets, paged_attn_meta)?
+                model.forward(&input_ids, &seqlen_offsets, paged_attn_meta, &flash_meta, pic_ctx_ref)?
             }
             Model::Qwen(ref model) => {
-                model.forward(&input_ids, &seqlen_offsets, context_lens, paged_attn_meta)?
+                model.forward(&input_ids, &seqlen_offsets, context_lens, paged_attn_meta, &flash_meta, pic_ctx_ref)?
             }
             Model::Qwen3(ref model) => {
-                model.forward(&input_ids, &seqlen_offsets, context_lens, paged_attn_meta)?
+                model.forward(&input_ids, &seqlen_offsets, context_lens, paged_attn_meta, &flash_meta, pic_ctx_ref)?
             }
             Model::Qwen3MoE(ref model) => {
-                model.forward(&input_ids, &seqlen_offsets, context_lens, paged_attn_meta)?
+                model.forward(&input_ids, &seqlen_offsets, context_lens, paged_attn_meta, &flash_meta, pic_ctx_ref)?
             }
         };
         if return_raw_logits {
