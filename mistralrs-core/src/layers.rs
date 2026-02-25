@@ -3367,3 +3367,178 @@ impl Module for ScaledEmbedding {
         xs.apply(&embedding)? * self.scale
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use candle_core::{DType, Device, Tensor};
+
+    const EPS: f64 = 1e-4;
+    const HEAD_DIM: usize = 4;
+    const NUM_HEADS: usize = 2;
+    const MAX_POS: usize = 64;
+
+    fn make_rope() -> RotaryEmbedding {
+        RotaryEmbedding::new(10000.0, HEAD_DIM, MAX_POS, &Device::Cpu, true, DType::F32).unwrap()
+    }
+
+    /// Create a tensor of shape (1, NUM_HEADS, seq_len, HEAD_DIM) filled with `val`.
+    fn make_qk(seq_len: usize, val: f32) -> Tensor {
+        Tensor::full(val, (1, NUM_HEADS, seq_len, HEAD_DIM), &Device::Cpu).unwrap()
+    }
+
+    /// Max absolute difference between two tensors.
+    fn max_abs_diff(a: &Tensor, b: &Tensor) -> f64 {
+        let diff = (a - b).unwrap().abs().unwrap();
+        diff.max(0)
+            .unwrap()
+            .max(0)
+            .unwrap()
+            .max(0)
+            .unwrap()
+            .max(0)
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap() as f64
+    }
+
+    // -------------------------------------------------------------------
+    // forward_per_token tests
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_forward_per_token_identity_at_pos_zero() {
+        let rope = make_rope();
+        let q = make_qk(1, 1.0);
+        let k = make_qk(1, 1.0);
+
+        let (q_out, k_out) = rope.forward_per_token(&q, &k, &[0], &[0]).unwrap();
+
+        // At position 0: cos=1, sin=0 → output should equal input
+        assert!(max_abs_diff(&q, &q_out) < EPS, "Q should be identity at pos 0");
+        assert!(max_abs_diff(&k, &k_out) < EPS, "K should be identity at pos 0");
+    }
+
+    #[test]
+    fn test_forward_per_token_nonzero_rotation() {
+        let rope = make_rope();
+        let q = make_qk(1, 1.0);
+        let k = make_qk(1, 1.0);
+
+        let (q_out, _k_out) = rope.forward_per_token(&q, &k, &[10], &[10]).unwrap();
+
+        // At position 10, output should differ from input
+        let diff = max_abs_diff(&q, &q_out);
+        assert!(diff > EPS, "Position 10 should produce rotation, diff={diff}");
+    }
+
+    #[test]
+    fn test_forward_per_token_sequential_matches_standard() {
+        let rope = make_rope();
+        let seq_len = 4;
+        let q = make_qk(seq_len, 1.0);
+        let k = make_qk(seq_len, 1.0);
+
+        // Per-token with sequential positions [0,1,2,3]
+        let positions: Vec<usize> = (0..seq_len).collect();
+        let (q_per, k_per) = rope
+            .forward_per_token(&q, &k, &positions, &positions)
+            .unwrap();
+
+        // Standard forward with offset=0
+        let (q_std, k_std) = rope.forward(&q, &k, &[0]).unwrap();
+
+        assert!(
+            max_abs_diff(&q_per, &q_std) < EPS,
+            "Per-token sequential Q should match standard forward"
+        );
+        assert!(
+            max_abs_diff(&k_per, &k_std) < EPS,
+            "Per-token sequential K should match standard forward"
+        );
+    }
+
+    #[test]
+    fn test_forward_per_token_non_contiguous() {
+        let rope = make_rope();
+        let seq_len = 4;
+        let q = make_qk(seq_len, 1.0);
+        let k = make_qk(seq_len, 1.0);
+
+        // Sequential positions
+        let seq_positions: Vec<usize> = (0..seq_len).collect();
+        let (q_seq, _) = rope
+            .forward_per_token(&q, &k, &seq_positions, &seq_positions)
+            .unwrap();
+
+        // Non-contiguous positions: [0, 5, 2, 10]
+        let non_contig = vec![0, 5, 2, 10];
+        let (q_nc, _) = rope
+            .forward_per_token(&q, &k, &non_contig, &non_contig)
+            .unwrap();
+
+        // Outputs should differ (at least at some positions)
+        let diff = max_abs_diff(&q_seq, &q_nc);
+        assert!(
+            diff > EPS,
+            "Non-contiguous positions should produce different output, diff={diff}"
+        );
+    }
+
+    #[test]
+    fn test_forward_k_only_matches_per_token_k() {
+        let rope = make_rope();
+        let seq_len = 4;
+        let q = make_qk(seq_len, 1.0);
+        let k = make_qk(seq_len, 2.0);
+        let positions: Vec<usize> = (0..seq_len).collect();
+
+        let (_, k_per) = rope
+            .forward_per_token(&q, &k, &positions, &positions)
+            .unwrap();
+
+        let k_only = rope.forward_k_only(&k, &positions).unwrap();
+
+        assert!(
+            max_abs_diff(&k_per, &k_only) < EPS,
+            "K-only should match per-token K output"
+        );
+    }
+
+    #[test]
+    fn test_forward_k_only_identity_at_pos_zero() {
+        let rope = make_rope();
+        let k = make_qk(1, 1.0);
+
+        let k_out = rope.forward_k_only(&k, &[0]).unwrap();
+
+        assert!(
+            max_abs_diff(&k, &k_out) < EPS,
+            "K-only at position 0 should be identity"
+        );
+    }
+
+    #[test]
+    fn test_forward_per_token_asymmetric_qk_lengths() {
+        let rope = make_rope();
+        // Decode scenario: Q has 1 token, K has 5 tokens
+        let q = make_qk(1, 1.0);
+        let k = make_qk(5, 1.0);
+
+        let q_positions = vec![4]; // Q at position 4
+        let k_positions = vec![0, 1, 2, 3, 4]; // K at positions 0..5
+
+        let (q_out, k_out) = rope
+            .forward_per_token(&q, &k, &q_positions, &k_positions)
+            .unwrap();
+
+        assert_eq!(q_out.dims(), &[1, NUM_HEADS, 1, HEAD_DIM]);
+        assert_eq!(k_out.dims(), &[1, NUM_HEADS, 5, HEAD_DIM]);
+
+        // Verify outputs are finite
+        let q_vec: Vec<f32> = q_out.flatten_all().unwrap().to_vec1().unwrap();
+        assert!(q_vec.iter().all(|v| v.is_finite()));
+        let k_vec: Vec<f32> = k_out.flatten_all().unwrap().to_vec1().unwrap();
+        assert!(k_vec.iter().all(|v| v.is_finite()));
+    }
+}

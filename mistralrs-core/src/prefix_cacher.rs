@@ -1,4 +1,4 @@
-use std::hash::{DefaultHasher, Hash, Hasher};
+use std::hash::Hash;
 use candle_core::{Device, Result};
 use indexmap::IndexMap;
 use itertools::Itertools;
@@ -326,5 +326,128 @@ impl PrefixCacheManagerV2 {
             content_hash,
             PicCacheElement { cache, roped_k },
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use candle_core::{DType, Device, Tensor};
+
+    /// Create a small KvCache with some data pre-populated.
+    fn make_kv_cache(seq_len: usize) -> KvCache {
+        let mut cache = KvCache::new_normal(2, 64, 16);
+        // Shape: (batch=1, heads=2, seq_len, head_dim=4)
+        let k = Tensor::ones((1, 2, seq_len, 4), DType::F32, &Device::Cpu).unwrap();
+        let v = Tensor::zeros((1, 2, seq_len, 4), DType::F32, &Device::Cpu).unwrap();
+        let _ = cache.append(&k, &v).unwrap();
+        cache
+    }
+
+    // -------------------------------------------------------------------
+    // PIC block cache tests
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_pic_block_add_and_search_hit() {
+        let mut mgr = PrefixCacheManagerV2::new(4, false, false);
+        let hash = 12345u64;
+        let cache = vec![Some(make_kv_cache(3))];
+
+        mgr.add_pic_block(hash, cache, None);
+
+        let result = mgr.search_for_pic_block(&[1, 2, 3], hash).unwrap();
+        assert!(result.is_some());
+        let (found_cache, found_roped_k) = result.unwrap();
+        assert_eq!(found_cache.len(), 1);
+        assert!(found_cache[0].is_some());
+        assert_eq!(found_cache[0].as_ref().unwrap().current_seq_len(), 3);
+        assert!(found_roped_k.is_none());
+    }
+
+    #[test]
+    fn test_pic_block_search_miss() {
+        let mut mgr = PrefixCacheManagerV2::new(4, false, false);
+        let hash = 12345u64;
+        let cache = vec![Some(make_kv_cache(3))];
+
+        mgr.add_pic_block(hash, cache, None);
+
+        let wrong_hash = 99999u64;
+        let result = mgr.search_for_pic_block(&[1, 2, 3], wrong_hash).unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_pic_block_search_with_roped_k() {
+        let mut mgr = PrefixCacheManagerV2::new(4, false, false);
+        let hash = 42u64;
+        let cache = vec![Some(make_kv_cache(4))];
+        // Pre-RoPE'd K tensor per layer: (1, heads=2, seq=4, dim=4)
+        let roped_k_tensor =
+            Tensor::ones((1, 2, 4, 4), DType::F32, &Device::Cpu).unwrap();
+        let roped_k = Some(vec![Some(roped_k_tensor.clone())]);
+
+        mgr.add_pic_block(hash, cache, roped_k);
+
+        let result = mgr.search_for_pic_block(&[10, 20, 30, 40], hash).unwrap();
+        assert!(result.is_some());
+        let (_, found_roped_k) = result.unwrap();
+        assert!(found_roped_k.is_some());
+        let roped_k_vec = found_roped_k.unwrap();
+        assert_eq!(roped_k_vec.len(), 1);
+        assert!(roped_k_vec[0].is_some());
+        assert_eq!(roped_k_vec[0].as_ref().unwrap().dims(), &[1, 2, 4, 4]);
+    }
+
+    #[test]
+    fn test_pic_block_disabled() {
+        let mut mgr = PrefixCacheManagerV2::new(4, true, false); // no_prefix_cache=true
+        let hash = 12345u64;
+        let cache = vec![Some(make_kv_cache(3))];
+
+        mgr.add_pic_block(hash, cache, None);
+
+        // Search should return None even with matching hash
+        let result = mgr.search_for_pic_block(&[1, 2, 3], hash).unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_pic_block_overwrite_same_hash() {
+        let mut mgr = PrefixCacheManagerV2::new(4, false, false);
+        let hash = 55555u64;
+
+        // First add: seq_len=2
+        let cache1 = vec![Some(make_kv_cache(2))];
+        mgr.add_pic_block(hash, cache1, None);
+
+        // Second add with same hash: seq_len=5
+        let cache2 = vec![Some(make_kv_cache(5))];
+        mgr.add_pic_block(hash, cache2, None);
+
+        let result = mgr.search_for_pic_block(&[1, 2, 3], hash).unwrap();
+        let (found_cache, _) = result.unwrap();
+        // Should have the second cache (seq_len=5), not the first
+        assert_eq!(found_cache[0].as_ref().unwrap().current_seq_len(), 5);
+    }
+
+    #[test]
+    fn test_pic_block_multiple_layers() {
+        let mut mgr = PrefixCacheManagerV2::new(4, false, false);
+        let hash = 77777u64;
+
+        // 3 layers: Some, None, Some — simulates sparse layer caching
+        let cache = vec![Some(make_kv_cache(3)), None, Some(make_kv_cache(4))];
+        mgr.add_pic_block(hash, cache, None);
+
+        let result = mgr.search_for_pic_block(&[1, 2, 3], hash).unwrap();
+        let (found_cache, _) = result.unwrap();
+        assert_eq!(found_cache.len(), 3);
+        assert!(found_cache[0].is_some());
+        assert!(found_cache[1].is_none());
+        assert!(found_cache[2].is_some());
+        assert_eq!(found_cache[0].as_ref().unwrap().current_seq_len(), 3);
+        assert_eq!(found_cache[2].as_ref().unwrap().current_seq_len(), 4);
     }
 }

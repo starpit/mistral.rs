@@ -1079,4 +1079,302 @@ mod tests {
         assert_eq!(hits, 0);
         assert_eq!(misses, 0);
     }
+
+    // -----------------------------------------------------------------------
+    // pic_sdpa_attention integration tests
+    // -----------------------------------------------------------------------
+
+    use std::collections::HashMap;
+    use crate::layers::RotaryEmbedding;
+
+    const HEAD_DIM: usize = 4;
+    const NUM_HEADS: usize = 2;
+    const MAX_POS: usize = 64;
+    const EPS: f64 = 1e-4;
+
+    fn cpu_flash_params() -> FlashParams {
+        FlashParams {
+            max_q: 0,
+            max_k: 0,
+            cumulative_seqlens_q: HashMap::new(),
+            cumulative_seqlens_k: HashMap::new(),
+            causal: false,
+        }
+    }
+
+    fn test_sdpa_params() -> SdpaParams {
+        SdpaParams {
+            n_kv_groups: 1,
+            softcap: None,
+            softmax_scale: 1.0 / (HEAD_DIM as f32).sqrt(),
+            sliding_window: None,
+            sinks: None,
+        }
+    }
+
+    fn test_rope() -> RotaryEmbedding {
+        RotaryEmbedding::new(10000.0, HEAD_DIM, MAX_POS, &Device::Cpu, true, DType::F32).unwrap()
+    }
+
+    /// Create a tensor of shape (1, NUM_HEADS, seq_len, HEAD_DIM) filled with `val`.
+    fn make_tensor(seq_len: usize, val: f32) -> Tensor {
+        Tensor::full(val, (1, NUM_HEADS, seq_len, HEAD_DIM), &Device::Cpu).unwrap()
+    }
+
+    fn make_kv_cache() -> KvCache {
+        KvCache::new_normal(2, MAX_POS, 16)
+    }
+
+    #[test]
+    fn test_pic_sdpa_output_shape() {
+        let rope = test_rope();
+        let flash = cpu_flash_params();
+        let sdpa = test_sdpa_params();
+        let seq_len = 6;
+
+        let q = make_tensor(seq_len, 1.0);
+        let k = make_tensor(seq_len, 1.0);
+        let v = make_tensor(seq_len, 1.0);
+        let mut cache = make_kv_cache();
+
+        let ctx = PicContext::new(vec![cross(0, 3), plus(3, 3)]);
+        let mask = ctx.make_pic_mask(seq_len, 0, &Device::Cpu, DType::F32).unwrap();
+
+        let out = pic_sdpa_attention(
+            &q, &k, &v, &ctx, &rope, &mut cache, Some(&mask), &flash, &sdpa,
+        )
+        .unwrap();
+
+        assert_eq!(out.dims(), &[1, NUM_HEADS, seq_len, HEAD_DIM]);
+        let vals: Vec<f32> = out.flatten_all().unwrap().to_vec1().unwrap();
+        assert!(vals.iter().all(|v| v.is_finite()), "Output must be finite");
+    }
+
+    #[test]
+    fn test_pic_sdpa_populates_cache() {
+        let rope = test_rope();
+        let flash = cpu_flash_params();
+        let sdpa = test_sdpa_params();
+        let seq_len = 6;
+
+        let q = make_tensor(seq_len, 1.0);
+        let k = make_tensor(seq_len, 1.0);
+        let v = make_tensor(seq_len, 1.0);
+        let mut cache = make_kv_cache();
+
+        let ctx = PicContext::new(vec![cross(0, 3), plus(3, 3)]);
+        let mask = ctx.make_pic_mask(seq_len, 0, &Device::Cpu, DType::F32).unwrap();
+
+        let _ = pic_sdpa_attention(
+            &q, &k, &v, &ctx, &rope, &mut cache, Some(&mask), &flash, &sdpa,
+        )
+        .unwrap();
+
+        assert_eq!(cache.current_seq_len(), seq_len);
+    }
+
+    #[test]
+    fn test_pic_sdpa_cross_only_matches_standard() {
+        let rope = test_rope();
+        let flash = cpu_flash_params();
+        let sdpa = test_sdpa_params();
+        let seq_len = 4;
+
+        let q = make_tensor(seq_len, 1.0);
+        let k = make_tensor(seq_len, 0.5);
+        let v = make_tensor(seq_len, 0.3);
+
+        // All-cross PIC context (no Plus blocks)
+        let ctx = PicContext::new(vec![cross(0, seq_len)]);
+        let mask = ctx.make_pic_mask(seq_len, 0, &Device::Cpu, DType::F32).unwrap();
+
+        let mut cache_pic = make_kv_cache();
+        let out_pic = pic_sdpa_attention(
+            &q, &k, &v, &ctx, &rope, &mut cache_pic, Some(&mask), &flash, &sdpa,
+        )
+        .unwrap();
+
+        // Standard path: apply RoPE manually, then SDPA
+        let mut cache_std = make_kv_cache();
+        let positions: Vec<usize> = (0..seq_len).collect();
+        let (q_roped, k_roped) = rope.forward_per_token(&q, &k, &positions, &positions).unwrap();
+        let (k_all, v_all) = cache_std.append(&k_roped, &v).unwrap();
+        let out_std = crate::layers::Sdpa.run_attention(
+            &q_roped,
+            &k_all,
+            &v_all,
+            Some(&mask),
+            Some(&flash),
+            &sdpa,
+        )
+        .unwrap();
+
+        let diff = (&out_pic - &out_std)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max(0)
+            .unwrap()
+            .max(0)
+            .unwrap()
+            .max(0)
+            .unwrap()
+            .max(0)
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap() as f64;
+        assert!(
+            diff < EPS,
+            "All-cross PIC should match standard SDPA, diff={diff}"
+        );
+    }
+
+    #[test]
+    fn test_pic_sdpa_plus_blocks_isolated() {
+        let rope = test_rope();
+        let flash = cpu_flash_params();
+        let sdpa = test_sdpa_params();
+
+        // Layout: Cross(2) Plus_A(2) Plus_B(2)
+        let seq_len = 6;
+        let q = make_tensor(seq_len, 1.0);
+        let k = make_tensor(seq_len, 1.0);
+        let v_a = Tensor::from_vec(
+            vec![1.0f32; NUM_HEADS * seq_len * HEAD_DIM],
+            (1, NUM_HEADS, seq_len, HEAD_DIM),
+            &Device::Cpu,
+        )
+        .unwrap();
+
+        let ctx = PicContext::new(vec![cross(0, 2), plus(2, 2), plus(4, 2)]);
+        let mask = ctx.make_pic_mask(seq_len, 0, &Device::Cpu, DType::F32).unwrap();
+
+        let mut cache_a = make_kv_cache();
+        let out_a = pic_sdpa_attention(
+            &q, &k, &v_a, &ctx, &rope, &mut cache_a, Some(&mask), &flash, &sdpa,
+        )
+        .unwrap();
+
+        // Change Plus_B's V values (indices 4,5) but keep everything else the same
+        let mut v_b_data = vec![1.0f32; NUM_HEADS * seq_len * HEAD_DIM];
+        // Modify Plus_B slice: for each head, positions 4 and 5
+        for h in 0..NUM_HEADS {
+            for s in 4..6 {
+                for d in 0..HEAD_DIM {
+                    v_b_data[h * seq_len * HEAD_DIM + s * HEAD_DIM + d] = 99.0;
+                }
+            }
+        }
+        let v_b = Tensor::from_vec(
+            v_b_data,
+            (1, NUM_HEADS, seq_len, HEAD_DIM),
+            &Device::Cpu,
+        )
+        .unwrap();
+
+        let mut cache_b = make_kv_cache();
+        let out_b = pic_sdpa_attention(
+            &q, &k, &v_b, &ctx, &rope, &mut cache_b, Some(&mask), &flash, &sdpa,
+        )
+        .unwrap();
+
+        // Plus_A tokens (indices 2,3) should produce the same output regardless of Plus_B's V
+        let out_a_plus_a = out_a.narrow(2, 2, 2).unwrap();
+        let out_b_plus_a = out_b.narrow(2, 2, 2).unwrap();
+        let diff = (&out_a_plus_a - &out_b_plus_a)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max(0)
+            .unwrap()
+            .max(0)
+            .unwrap()
+            .max(0)
+            .unwrap()
+            .max(0)
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap() as f64;
+        assert!(
+            diff < EPS,
+            "Plus_A output should be isolated from Plus_B content changes, diff={diff}"
+        );
+    }
+
+    #[test]
+    fn test_pic_sdpa_decode_step() {
+        let rope = test_rope();
+        let flash = cpu_flash_params();
+        let sdpa = test_sdpa_params();
+
+        // First: fill 6 tokens
+        let fill_len = 6;
+        let q = make_tensor(fill_len, 1.0);
+        let k = make_tensor(fill_len, 1.0);
+        let v = make_tensor(fill_len, 1.0);
+        let mut cache = make_kv_cache();
+
+        let ctx = PicContext::new(vec![cross(0, 3), plus(3, 3)]);
+        let mask = ctx.make_pic_mask(fill_len, 0, &Device::Cpu, DType::F32).unwrap();
+
+        let _ = pic_sdpa_attention(
+            &q, &k, &v, &ctx, &rope, &mut cache, Some(&mask), &flash, &sdpa,
+        )
+        .unwrap();
+        assert_eq!(cache.current_seq_len(), fill_len);
+
+        // Decode: 1 new token
+        let q_dec = make_tensor(1, 0.5);
+        let k_dec = make_tensor(1, 0.5);
+        let v_dec = make_tensor(1, 0.5);
+
+        // For decode, extend context: the new token is cross at position 6
+        let mut ctx_dec = PicContext::new(vec![cross(0, 3), plus(3, 3), cross(6, 1)]);
+        ctx_dec.has_pre_roped_k = true;
+
+        let out_dec = pic_sdpa_attention(
+            &q_dec,
+            &k_dec,
+            &v_dec,
+            &ctx_dec,
+            &rope,
+            &mut cache,
+            None,
+            &flash,
+            &sdpa,
+        )
+        .unwrap();
+
+        assert_eq!(out_dec.dims(), &[1, NUM_HEADS, 1, HEAD_DIM]);
+        assert_eq!(cache.current_seq_len(), fill_len + 1);
+        let vals: Vec<f32> = out_dec.flatten_all().unwrap().to_vec1().unwrap();
+        assert!(vals.iter().all(|v| v.is_finite()), "Decode output must be finite");
+    }
+
+    #[test]
+    fn test_pic_sdpa_pre_roped_k_path() {
+        let rope = test_rope();
+        let flash = cpu_flash_params();
+        let sdpa = test_sdpa_params();
+        let seq_len = 4;
+
+        let q = make_tensor(seq_len, 1.0);
+        let k = make_tensor(seq_len, 1.0);
+        let v = make_tensor(seq_len, 1.0);
+        let mut cache = make_kv_cache();
+
+        let mut ctx = PicContext::new(vec![cross(0, 2), plus(2, 2)]);
+        ctx.has_pre_roped_k = true;
+
+        let mask = ctx.make_pic_mask(seq_len, 0, &Device::Cpu, DType::F32).unwrap();
+
+        let out = pic_sdpa_attention(
+            &q, &k, &v, &ctx, &rope, &mut cache, Some(&mask), &flash, &sdpa,
+        )
+        .unwrap();
+
+        assert_eq!(out.dims(), &[1, NUM_HEADS, seq_len, HEAD_DIM]);
+        let vals: Vec<f32> = out.flatten_all().unwrap().to_vec1().unwrap();
+        assert!(vals.iter().all(|v| v.is_finite()), "Pre-roped K path output must be finite");
+    }
 }

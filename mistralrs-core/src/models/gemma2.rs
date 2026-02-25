@@ -584,11 +584,15 @@ impl Model {
     ) -> Result<Tensor> {
         let mut xs = (input_embeds * (self.hidden_size as f64).sqrt())?;
         let cache = &mut self.cache.normal().0;
-        // When PIC context is present, use block-attention mask instead of causal mask
-        let attention_mask = if let Some(pic_ctx) = pic_context {
+        // When PIC context is present, use block-attention mask for both causal and
+        // sliding window layers (the PIC mask already encodes the block-attention pattern).
+        let (attention_mask, sliding_attention_mask) = if let Some(pic_ctx) = pic_context {
             let (_b_sz, tgt_len) = input_ids.dims2()?;
             if tgt_len == 1 {
-                DeviceMappedMask::new(None, &*self.mapper)?
+                (
+                    DeviceMappedMask::new(None, &*self.mapper)?,
+                    DeviceMappedMask::new(None, &*self.mapper)?,
+                )
             } else {
                 let past_kv_len = cache[0].current_seq_len();
                 let pic_mask = pic_ctx.make_pic_mask(
@@ -597,7 +601,16 @@ impl Model {
                     xs.device(),
                     xs.dtype(),
                 )?;
-                DeviceMappedMask::new(Some(pic_mask), &*self.mapper)?
+                let pic_mask2 = pic_ctx.make_pic_mask(
+                    tgt_len,
+                    past_kv_len,
+                    xs.device(),
+                    xs.dtype(),
+                )?;
+                (
+                    DeviceMappedMask::new(Some(pic_mask), &*self.mapper)?,
+                    DeviceMappedMask::new(Some(pic_mask2), &*self.mapper)?,
+                )
             }
         } else {
             let mask = CausalMasker.make_causal_mask_matrix(
@@ -616,15 +629,7 @@ impl Model {
                     .map(|(_, meta)| meta.is_first_prompt_chunk)
                     .unwrap_or(true)
             });
-            DeviceMappedMask::new(mask, &*self.mapper)?
-        };
-
-        // For PIC, use the same mask for sliding window layers (the PIC mask
-        // already encodes the correct block-attention pattern).
-        let sliding_attention_mask = if pic_context.is_some() {
-            attention_mask.clone()
-        } else {
-            let mask = CausalMasker.make_sliding_window_causal_mask_matrix(
+            let sliding_mask = CausalMasker.make_sliding_window_causal_mask_matrix(
                 input_ids,
                 metadata
                     .as_ref()
@@ -635,13 +640,16 @@ impl Model {
                 self.cfg.num_attn_heads,
             )?;
             // PagedAttention prompt chunking
-            let mask = mask.filter(|_| {
+            let sliding_mask = sliding_mask.filter(|_| {
                 metadata
                     .as_ref()
                     .map(|(_, meta)| meta.is_first_prompt_chunk)
                     .unwrap_or(true)
             });
-            DeviceMappedMask::new(mask, &*self.mapper)?
+            (
+                DeviceMappedMask::new(mask, &*self.mapper)?,
+                DeviceMappedMask::new(sliding_mask, &*self.mapper)?,
+            )
         };
         for (i, layer) in self.layers.iter().enumerate() {
             xs = self.mapper.map(xs, i)?;
