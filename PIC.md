@@ -10,9 +10,30 @@
 
 **Diff:** +1082 lines in new file (`pic.rs`), +2906/-374 lines across 53 existing files, +202 lines docs.
 
+### Why so many files?
+
+The +2906/-374 across 53 existing files looks alarming but breaks down into a few structural causes:
+
+| Category | Files | ~Lines | Why |
+|----------|-------|--------|-----|
+| Per-model attention wiring | 21 | +1870/-326 | Each of the 16 normal + 5 GGUF models has its own inline `forward()` with model-specific RoPE and mask logic. There is no shared attention base class — the PIC branch (call `pic_sdpa_attention` instead of the normal RoPE→cache→SDPA path, swap causal mask for block mask) must be inserted into each model individually. ~80 lines per model. |
+| RoPE trait implementations | 1 | +294 | Six distinct RoPE variants (`RotaryEmbedding`, `Llama3RotaryEmbedding`, `PhiRotaryEmbedding`, `SmolLm3RotaryEmbedding`, `DeepSeekV2RotaryEmbedding`, `GptOssRotaryEmbedding`) each need `PicRope` because they differ internally (interleaved vs GPT-NeoX layout, partial rotary dims, short/long tables, YARN scaling). The existing `forward()` takes a single `seqlen_offset`, not per-token positions, so the per-token gather can't reuse it. |
+| Engine / scheduler plumbing | 5 | +419/-21 | `add_request.rs` alone is +339: in-band marker extraction, token boundary resolution via `find_subsequence`, PIC cache lookup, composite KV assembly, fallback-to-full-prefill. Plus smaller changes in `sampling.rs` (post-generation cache save), `sequence.rs`, `request.rs`, `inputs_processor.rs`. |
+| Cache infrastructure | 2 | +106 | New `PicCacheElement` storage + `search_for_pic_block`/`add_pic_block` in `prefix_cacher.rs`; new `narrow_range` on `KvCache` for extracting per-block KV slices. |
+| Pipeline trait / dispatch | 5 | +88/-7 | Adding `forward_pic()` and `pic_pre_rope_k()` to the `NormalModel` trait with defaults, plus dispatch in `normal.rs`, `gguf.rs`, `ggml.rs`. |
+| API entry-point plumbing | 14 | +36 | Adding `pic_context: None` at every `NormalRequest` construction site: server, Python bindings, Rust SDK, CLI, benchmarks, vision processors. One line each, but 14 files. |
+
+The core PIC logic is concentrated in one new file (`pic.rs`, 600 lines of logic + 485 lines of tests). The remaining 2906 lines are integration cost — the price of mistral.rs having 21 independent model implementations with no shared attention layer, 6 RoPE variants, and ~14 API entry points that all construct `NormalRequest`.
+
 ---
 
 PIC enables KV cache reuse for content blocks that appear at different positions across requests. Standard transformer KV caches store RoPE-encoded K tensors, making cache entries position-dependent. PIC stores un-rotated K for designated "Plus" blocks and applies RoPE at attention time, making those cache entries relocatable. This is the engine-level implementation; see the root `README_PIC.md` for spnl query syntax, benchmarking, and usage.
+
+## Hardware portability
+
+The entire PIC implementation is **device-agnostic** — zero lines of Metal- or CUDA-specific code. All PIC logic (deferred RoPE, block attention masking, content-based cache hashing, cross-request cache assembly, per-model attention wiring) is written against candle's device-agnostic tensor API (`index_select`, `narrow`, `cat`, `slice_set`, `zeros`, `Sdpa.run_attention`). It runs identically on Metal, CUDA, and CPU; the hardware backend only affects performance of the underlying tensor ops and attention kernels, which are handled by candle and the existing mistral.rs infrastructure.
+
+The `--features metal` / `--features cuda` build flags control which candle backend is compiled, not anything in the PIC code itself.
 
 ## Deferred RoPE
 
