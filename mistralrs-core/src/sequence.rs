@@ -620,16 +620,32 @@ impl Sequence {
     /// Pre-loads the cached Plus block KV entries into the sequence's normal cache,
     /// sets the PIC context for deferred RoPE, and configures the remaining tokens
     /// (cross tokens) for prefill.
+    ///
+    /// IMPORTANT: `token_offset` must be set to the cache length so the engine
+    /// selects `CacheInstruction::In` (which clones the pre-loaded cache into
+    /// the model) rather than `CacheInstruction::Reset` (which would wipe it).
+    /// See `engine/mod.rs` line with `token_offset() != 0`.
     pub fn prefill_v2_pic(
         mut self,
         cache: Vec<Option<KvCache>>,
         pic_context: PicContext,
         remaining_toks: Vec<u32>,
     ) -> Self {
+        let offset = cache
+            .first()
+            .and_then(|c| c.as_ref())
+            .map(|c| c.current_seq_len())
+            .unwrap_or(0);
+        debug_assert!(
+            offset > 0,
+            "prefill_v2_pic called with empty cache — token_offset would be 0, \
+             causing the engine to Reset (wipe) the cache instead of cloning it in"
+        );
         self.normal_cache = cache;
         self.pic_context = Some(pic_context);
         self.prefill_prompt_toks = Some(remaining_toks);
         self.set_state(SequenceState::RunningPrefillPrompt);
+        self.token_offset = offset;
         self
     }
 

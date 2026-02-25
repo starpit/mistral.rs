@@ -2516,13 +2516,16 @@ impl RotaryEmbedding {
             candle_nn::rotary_emb::rope_i
         };
 
-        // Gather cos/sin for Q positions
-        let q_cos = self.gather_positions(&self.cos, q_positions)?;
-        let q_sin = self.gather_positions(&self.sin, q_positions)?;
+        // Gather cos/sin for Q positions, casting to match input dtype
+        // (GGUF models may produce BF16 Q/K while cos/sin are stored as F32)
+        let q_dtype = q.dtype();
+        let q_cos = self.gather_positions(&self.cos, q_positions)?.to_dtype(q_dtype)?;
+        let q_sin = self.gather_positions(&self.sin, q_positions)?.to_dtype(q_dtype)?;
 
         // Gather cos/sin for K positions
-        let k_cos = self.gather_positions(&self.cos, k_positions)?;
-        let k_sin = self.gather_positions(&self.sin, k_positions)?;
+        let k_dtype = k.dtype();
+        let k_cos = self.gather_positions(&self.cos, k_positions)?.to_dtype(k_dtype)?;
+        let k_sin = self.gather_positions(&self.sin, k_positions)?.to_dtype(k_dtype)?;
 
         let q_embed = rope(&q.contiguous()?, &q_cos, &q_sin)?;
         let k_embed = rope(&k.contiguous()?, &k_cos, &k_sin)?;
@@ -2550,8 +2553,9 @@ impl RotaryEmbedding {
         } else {
             candle_nn::rotary_emb::rope_i
         };
-        let k_cos = self.gather_positions(&self.cos, k_positions)?;
-        let k_sin = self.gather_positions(&self.sin, k_positions)?;
+        let k_dtype = k.dtype();
+        let k_cos = self.gather_positions(&self.cos, k_positions)?.to_dtype(k_dtype)?;
+        let k_sin = self.gather_positions(&self.sin, k_positions)?.to_dtype(k_dtype)?;
         rope(&k.contiguous()?, &k_cos, &k_sin)
     }
 }

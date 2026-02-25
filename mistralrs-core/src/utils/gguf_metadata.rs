@@ -151,9 +151,18 @@ impl ContentMetadata<'_> {
     }
 
     pub fn verify_arch_any(&self, expected_arch: &[&str]) -> Result<()> {
-        expected_arch
-            .iter()
-            .try_for_each(|arch| self.verify_arch(arch))
+        let actual_arch: String = self
+            .metadata
+            .get("general.architecture")
+            .cloned()
+            .try_value_into()?;
+
+        anyhow::ensure!(
+            expected_arch.iter().any(|&arch| arch == actual_arch),
+            "Expected one of {expected_arch:?} architectures, got `{actual_arch}`."
+        );
+
+        Ok(())
     }
 }
 
