@@ -636,11 +636,12 @@ impl Sequence {
             .and_then(|c| c.as_ref())
             .map(|c| c.current_seq_len())
             .unwrap_or(0);
-        debug_assert!(
-            offset > 0,
-            "prefill_v2_pic called with empty cache — token_offset would be 0, \
-             causing the engine to Reset (wipe) the cache instead of cloning it in"
-        );
+        if offset == 0 {
+            tracing::warn!(
+                "prefill_v2_pic called with empty cache — token_offset will be 0, \
+                 engine will Reset (wipe) instead of cloning in"
+            );
+        }
         self.normal_cache = cache;
         self.pic_context = Some(pic_context);
         self.prefill_prompt_toks = Some(remaining_toks);

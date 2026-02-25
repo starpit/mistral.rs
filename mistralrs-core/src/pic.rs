@@ -189,46 +189,20 @@ pub struct PicContext {
 impl PicContext {
     /// Create a new PIC context from a list of blocks.
     ///
-    /// Computes position IDs automatically:
-    /// - Cross blocks get sequential absolute positions
-    /// - Plus blocks get positions starting from 0 within each block
+    /// All tokens get sequential positions (0, 1, 2, ..., total_len-1),
+    /// identical to standard causal. The model was trained with monotonically
+    /// increasing positions, so we preserve that invariant. Position-
+    /// independence for cache reuse comes from storing un-RoPE'd K and
+    /// re-applying RoPE at the new sequential positions, not from position
+    /// reassignment.
     pub fn new(blocks: Vec<PicBlock>) -> Self {
-        // Total length must cover all positions including gaps between blocks
-        // (e.g., chat template header tokens not belonging to any message block).
         let total_len = blocks
             .iter()
             .map(|b| b.start + b.len)
             .max()
             .unwrap_or(0);
-        let mut position_ids = vec![0usize; total_len];
-        let mut cross_pos = 0usize;
-
-        // First pass: assign positions to all gap tokens (not in any block) as Cross
-        // by filling sequentially, then overwrite with block-specific positions.
-        for i in 0..total_len {
-            position_ids[i] = cross_pos;
-            cross_pos += 1;
-        }
-
-        // Second pass: overwrite Plus block positions with block-local positions.
-        // Cross blocks keep their sequential positions from the first pass.
-        // Reset cross_pos to recount correctly.
-        cross_pos = 0;
-        for i in 0..total_len {
-            let in_plus = blocks
-                .iter()
-                .any(|b| b.is_plus && i >= b.start && i < b.start + b.len);
-            if in_plus {
-                let block = blocks
-                    .iter()
-                    .find(|b| b.is_plus && i >= b.start && i < b.start + b.len)
-                    .unwrap();
-                position_ids[i] = i - block.start;
-            } else {
-                position_ids[i] = cross_pos;
-                cross_pos += 1;
-            }
-        }
+        // Sequential positions: 0, 1, 2, ..., total_len-1
+        let position_ids: Vec<usize> = (0..total_len).collect();
 
         Self {
             blocks,
@@ -548,25 +522,15 @@ mod tests {
 
     #[test]
     fn test_pic_context_positions() {
+        // All positions are sequential regardless of block type
         let ctx = PicContext::new(vec![cross(0, 5), plus(5, 3), cross(8, 2)]);
 
-        // Cross block: positions 0..5
-        assert_eq!(ctx.position_ids[0], 0);
-        assert_eq!(ctx.position_ids[4], 4);
-
-        // Plus block: local positions 0..3
-        assert_eq!(ctx.position_ids[5], 0);
-        assert_eq!(ctx.position_ids[6], 1);
-        assert_eq!(ctx.position_ids[7], 2);
-
-        // Second cross block: continues from 5 (skipping Plus tokens)
-        assert_eq!(ctx.position_ids[8], 5);
-        assert_eq!(ctx.position_ids[9], 6);
+        assert_eq!(&ctx.position_ids[..], &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9]);
     }
 
     #[test]
     fn test_positions_multiple_plus_blocks() {
-        // Cross(3) Plus(2) Cross(1) Plus(4) Cross(2)
+        // Cross(3) Plus(2) Cross(1) Plus(4) Cross(2) = 12 tokens
         let ctx = PicContext::new(vec![
             cross(0, 3),
             plus(3, 2),
@@ -575,26 +539,14 @@ mod tests {
             cross(10, 2),
         ]);
 
-        // First cross: 0,1,2
-        assert_eq!(&ctx.position_ids[0..3], &[0, 1, 2]);
-        // First plus: local 0,1
-        assert_eq!(&ctx.position_ids[3..5], &[0, 1]);
-        // Middle cross: continues at 3
-        assert_eq!(ctx.position_ids[5], 3);
-        // Second plus: local 0,1,2,3
-        assert_eq!(&ctx.position_ids[6..10], &[0, 1, 2, 3]);
-        // Final cross: continues at 4,5
-        assert_eq!(&ctx.position_ids[10..12], &[4, 5]);
+        assert_eq!(&ctx.position_ids[..], &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]);
     }
 
     #[test]
     fn test_positions_plus_at_start() {
         let ctx = PicContext::new(vec![plus(0, 4), cross(4, 3)]);
 
-        // Plus block: local 0..4
-        assert_eq!(&ctx.position_ids[0..4], &[0, 1, 2, 3]);
-        // Cross starts at 0 (no prior cross tokens)
-        assert_eq!(&ctx.position_ids[4..7], &[0, 1, 2]);
+        assert_eq!(&ctx.position_ids[..], &[0, 1, 2, 3, 4, 5, 6]);
     }
 
     #[test]
@@ -603,11 +555,7 @@ mod tests {
         let ctx = PicContext::new(vec![cross(0, 3), plus(5, 3), cross(8, 2)]);
 
         assert_eq!(ctx.total_len, 10);
-        // Gap tokens (3,4) are treated as cross
-        assert_eq!(&ctx.position_ids[0..3], &[0, 1, 2]);
-        assert_eq!(&ctx.position_ids[3..5], &[3, 4]); // gap = cross
-        assert_eq!(&ctx.position_ids[5..8], &[0, 1, 2]); // plus = local
-        assert_eq!(&ctx.position_ids[8..10], &[5, 6]); // cross continues
+        assert_eq!(&ctx.position_ids[..], &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9]);
     }
 
     #[test]
@@ -625,11 +573,10 @@ mod tests {
 
     #[test]
     fn test_positions_adjacent_plus_blocks() {
-        // Two plus blocks back to back — each gets local positions
+        // Sequential positions even across adjacent Plus blocks
         let ctx = PicContext::new(vec![plus(0, 3), plus(3, 2)]);
 
-        assert_eq!(&ctx.position_ids[0..3], &[0, 1, 2]);
-        assert_eq!(&ctx.position_ids[3..5], &[0, 1]);
+        assert_eq!(&ctx.position_ids[..], &[0, 1, 2, 3, 4]);
     }
 
     // -----------------------------------------------------------------------
@@ -1413,67 +1360,57 @@ mod tests {
             .unwrap() as f64
     }
 
-    /// Core PIC invariant: reordering Plus blocks must not change the final
-    /// Cross-token output.
-    ///
-    /// Layout A: Cross(3) Plus_X(2) Plus_Y(2) Cross(1) = 8 tokens
-    /// Layout B: Cross(3) Plus_Y(2) Plus_X(2) Cross(1) = 8 tokens (swapped)
-    ///
-    /// When swapping, BOTH K and V data move with the block — this simulates
-    /// what actually happens when documents are reordered. The Cross token at
-    /// the end sees the same block contents with the same block-local positions,
-    /// just concatenated in a different sequence order.
+    /// With sequential positions, PIC attention on the initial fill should
+    /// produce the same result as standard causal attention (since positions
+    /// and mask are identical to flat when all blocks use sequential positions
+    /// and the mask is standard causal for Cross-sees-everything).
     #[test]
-    fn test_pic_order_independence_cross_output() {
+    fn test_pic_sequential_positions_match_flat() {
         let rope = test_rope();
         let flash = cpu_flash_params();
         let sdpa = test_sdpa_params();
 
+        // Layout: Cross(3) Plus_A(2) Plus_B(2) Cross(1) = 8 tokens
         let seq_len = 8;
-
-        // Build per-block K, V, Q pieces with distinct values
         let q = make_rand_tensor(seq_len, 1);
+        let k = make_rand_tensor(seq_len, 2);
+        let v = make_rand_tensor(seq_len, 3);
 
-        let k_cross_head = make_rand_tensor(3, 10);
-        let k_plus_x = make_rand_tensor(2, 20);
-        let k_plus_y = make_rand_tensor(2, 30);
-        let k_cross_tail = make_rand_tensor(1, 40);
-
-        let v_cross_head = make_rand_tensor(3, 50);
-        let v_plus_x = make_rand_tensor(2, 60);
-        let v_plus_y = make_rand_tensor(2, 70);
-        let v_cross_tail = make_rand_tensor(1, 80);
-
-        // Layout A: Cross(3) Plus_X(2) Plus_Y(2) Cross(1)
-        let k_a = Tensor::cat(&[&k_cross_head, &k_plus_x, &k_plus_y, &k_cross_tail], 2).unwrap();
-        let v_a = Tensor::cat(&[&v_cross_head, &v_plus_x, &v_plus_y, &v_cross_tail], 2).unwrap();
-        let ctx_a = PicContext::new(vec![cross(0, 3), plus(3, 2), plus(5, 2), cross(7, 1)]);
-        let mask_a = ctx_a.make_pic_mask(seq_len, 0, &Device::Cpu, DType::F32).unwrap();
-        let mut cache_a = make_kv_cache();
-        let out_a = pic_sdpa_attention(
-            &q, &k_a, &v_a, &ctx_a, &rope, &mut cache_a, Some(&mask_a), &flash, &sdpa,
+        // PIC path
+        let ctx = PicContext::new(vec![cross(0, 3), plus(3, 2), plus(5, 2), cross(7, 1)]);
+        let mask = ctx.make_pic_mask(seq_len, 0, &Device::Cpu, DType::F32).unwrap();
+        let mut cache_pic = make_kv_cache();
+        let out_pic = pic_sdpa_attention(
+            &q, &k, &v, &ctx, &rope, &mut cache_pic, Some(&mask), &flash, &sdpa,
         ).unwrap();
 
-        // Layout B: Cross(3) Plus_Y(2) Plus_X(2) Cross(1) — K and V swapped together
-        let k_b = Tensor::cat(&[&k_cross_head, &k_plus_y, &k_plus_x, &k_cross_tail], 2).unwrap();
-        let v_b = Tensor::cat(&[&v_cross_head, &v_plus_y, &v_plus_x, &v_cross_tail], 2).unwrap();
-        let ctx_b = PicContext::new(vec![cross(0, 3), plus(3, 2), plus(5, 2), cross(7, 1)]);
-        let mask_b = ctx_b.make_pic_mask(seq_len, 0, &Device::Cpu, DType::F32).unwrap();
-        let mut cache_b = make_kv_cache();
-        let out_b = pic_sdpa_attention(
-            &q, &k_b, &v_b, &ctx_b, &rope, &mut cache_b, Some(&mask_b), &flash, &sdpa,
+        // For the trailing Cross token (idx 7), which attends to everything,
+        // the PIC output should match standard causal (since positions are
+        // sequential and the Cross token sees all prior tokens).
+        let positions: Vec<usize> = (0..seq_len).collect();
+        let (q_roped, k_roped) = rope.pic_forward_per_token(
+            &q, &k, &positions, &positions,
+        ).unwrap();
+        let mut cache_std = make_kv_cache();
+        let (k_all, v_all) = cache_std.append(&k_roped, &v).unwrap();
+
+        // Use standard causal mask for comparison
+        let causal_mask_data: Vec<f32> = (0..seq_len)
+            .flat_map(|i| (0..seq_len).map(move |j| if j <= i { 0.0 } else { f32::NEG_INFINITY }))
+            .collect();
+        let causal_mask = Tensor::from_vec(causal_mask_data, (seq_len, seq_len), &Device::Cpu).unwrap();
+
+        let out_std = Sdpa.run_attention(
+            &q_roped, &k_all, &v_all, Some(&causal_mask), Some(&flash), &sdpa,
         ).unwrap();
 
-        // The final Cross token (idx 7) sees the same Cross tokens at the same
-        // positions, and the same two Plus blocks with the same block-local
-        // RoPE (0,1). Since both K and V moved together, the attention weights
-        // and weighted V sums should be identical.
-        let cross_out_a = out_a.narrow(2, 7, 1).unwrap();
-        let cross_out_b = out_b.narrow(2, 7, 1).unwrap();
-        let diff = max_abs_diff(&cross_out_a, &cross_out_b);
+        // Compare trailing Cross token output
+        let pic_last = out_pic.narrow(2, 7, 1).unwrap();
+        let std_last = out_std.narrow(2, 7, 1).unwrap();
+        let diff = max_abs_diff(&pic_last, &std_last);
         assert!(
             diff < EPS,
-            "Cross token output must be order-independent, got diff={diff}"
+            "PIC trailing Cross should match standard causal with sequential positions, diff={diff}"
         );
     }
 
