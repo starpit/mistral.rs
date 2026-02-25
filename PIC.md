@@ -4,9 +4,9 @@
 
 **Full deferred-RoPE support:** Llama, Qwen2, Qwen3, Qwen3 MoE, Qwen3 Next, Mistral, Mixtral, Gemma, Gemma 2, StarCoder2, Phi-2, Phi-3/4, Phi-3.5 MoE, SmolLM3, Granite, GPT-OSS -- plus GGUF variants of Llama, Qwen2, Qwen3, Qwen3 MoE, StarCoder2.
 
-**Approximate cache reuse (no deferred RoPE):** GGUF Phi-2, GGUF Phi-3 (custom cos/sin RoPE), XLoRA models, GLM-4. Cache infrastructure still fires -- real TTFT speedup, but K tensors have wrong positional encoding at new positions.
+**Approximate cache reuse (no deferred RoPE):** GGUF Phi-2, GGUF Phi-3 (custom cos/sin RoPE), XLoRA models, GLM-4, GLM-4 MoE. Cache infrastructure still fires -- real TTFT speedup, but K tensors have wrong positional encoding at new positions.
 
-**No support:** Vision model text backbones, DeepSeek V2/V3 (MLA attention; PicRope trait implemented, model wiring pending).
+**No support:** Vision model text backbones, DeepSeek V2/V3 and GLM-4 MoE Lite (MLA attention; PicRope trait implemented, model wiring pending).
 
 **Diff:** +1082 lines in new file (`pic.rs`), +2906/-374 lines across 53 existing files, +202 lines docs.
 
@@ -151,6 +151,7 @@ Implementations exist for: `RotaryEmbedding`, `Llama3RotaryEmbedding`, `SmolLm3R
 | Granite (MoE Hybrid) | RotaryEmbedding (optional) | Full (nope layers skipped; Mamba layers unaffected) |
 | GPT-OSS | GptOssRotaryEmbeddingVariant | Full (Standard + YARN variants) |
 | DeepSeek V2/V3 | DeepSeekV2RotaryEmbedding | PicRope implemented; model-level wiring pending (MLA attention is structurally different) |
+| GLM-4 MoE Lite | DeepSeekV2RotaryEmbedding | No — MLA attention like DeepSeek; same structural challenge |
 | **GGUF Llama** | RotaryEmbedding | Full |
 | **GGUF Qwen2** | RotaryEmbedding | Full |
 | **GGUF Qwen3** | RotaryEmbedding | Full |
@@ -169,11 +170,23 @@ However, the cached K tensors retain **position-dependent RoPE encoding** from t
 
 The following model types lack deferred RoPE, so PIC cache reuse is approximate (see above) — cached K has incorrect positional encoding at new positions:
 
-- **GGUF Phi-2**: Custom partial RoPE with raw cos/sin tensors (not `RotaryEmbedding`)
-- **GGUF Phi-3**: Custom long/short RoPE implementation (not `PhiRotaryEmbedding`)
-- **GLM-4 / GLM-4 MoE**: Custom local RoPE implementation
-- **XLoRA models**: Different forward path
-- **Vision model text backbones**: Separate model implementations in `vision_models/`
+| Model | Blocker | Effort |
+|-------|---------|--------|
+| **GLM-4 / GLM-4 MoE** | Custom local `RotaryEmbedding` struct (partial rotary, `rope_i` layout) in `glm4.rs`/`glm4_moe.rs` — not using the shared `RotaryEmbedding` from `layers.rs`. Standard Q/K/V attention otherwise. | **Medium (~100-120 lines each).** Implement `PicRope` for GLM-4's local `RotaryEmbedding` (~50 lines), then wire the attention PIC branch + mask + `NormalModel` overrides (~60-70 lines per model). Same model twice since GLM-4 and GLM-4 MoE have identical RoPE structs. |
+| **GGUF Phi-2** | Custom partial RoPE with raw cos/sin tensors loaded from GGUF metadata and `precomput_freqs_cis`. Not using any shared RoPE type. | **Medium (~80-100 lines).** Need a `PicRope` impl that does per-token gather from the precomputed cos/sin tables with partial rotary dim handling. The attention path is standard SDPA. |
+| **GGUF Phi-3** | Custom long/short RoPE implementation with precomputed cos/sin via `precomput_freqs_cis`. Has its own `apply_rotary_emb` using `candle_nn::rotary_emb::rope`. Not using shared `PhiRotaryEmbedding`. | **Medium (~80-100 lines).** Same approach as GGUF Phi-2 — `PicRope` for per-token position gather from cos/sin tables, then attention wiring. |
+| **XLoRA models** | Separate forward path (`xlora_forward`) with dual input processing (`input_ids` + `input_ids_full`), no-kv-cache mode, and non-granular state tracking. PIC would need to thread through both paths. | **Hard (~150+ lines per XLoRA model).** The dual-forward-pass architecture is fundamentally different from the standard path. Low priority — XLoRA is a niche use case. |
+| **Vision model text backbones** | Separate model implementations in `vision_models/` (e.g., LLaVA-Mistral, Phi3V, Idefics2/3). Each has its own copy of the text model's attention code. | **Medium per model (~80 lines each), but many models.** Each vision model's text backbone would need the same PIC wiring as the base text model. Low priority — vision inputs with PIC is an unusual use case. |
+
+### Not yet supported (MLA attention — structural mismatch)
+
+These models use Multi-head Latent Attention (MLA) where Q and K are split into `nope` (non-positional) and `pe` (positional) components, RoPE applies only to the `pe` slice, and KV is stored in compressed form (`kv_lora_rank`). The existing `pic_sdpa_attention` helper assumes standard full-K RoPE and does not fit this architecture.
+
+| Model | Blocker | Effort |
+|-------|---------|--------|
+| **DeepSeek V2** | MLA with `q_nope/q_pe` + `k_nope/k_pe` split, compressed KV (`kv_a_proj_with_mqa` → `kv_a_layernorm` → `kv_b_proj`), three attention strategies (`mla_decode_forward`, `mla_cache_forward`, standard SDPA). `PicRope` already implemented for `DeepSeekV2RotaryEmbedding`. | **Hard (~200-300 lines).** Needs a new `pic_mla_attention` helper (or significant refactoring of `pic_sdpa_attention`) that understands: (1) RoPE only on the `pe` portion of K, (2) deferred RoPE interacting with compressed KV storage, (3) the `k_nope` portion being position-independent by construction but entangled with `kv_b_proj`. The MLA decode and MLA cache fast paths add further complexity. |
+| **DeepSeek V3** | Same MLA architecture as V2 (shares `deepseek2.rs` patterns). | **Same as V2** — once a `pic_mla_attention` helper exists, V3 wiring is mechanical. |
+| **GLM-4 MoE Lite** | Uses MLA attention (imports `mla_cache_forward`/`mla_decode_forward`/`MlaWeights`). Same split-K/compressed-KV pattern as DeepSeek. | **Same as DeepSeek** — blocked on the same `pic_mla_attention` helper. |
 
 ## Key types
 
