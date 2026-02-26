@@ -874,51 +874,33 @@ impl Engine {
                         }
 
                         if !parts.is_empty() && total_len > 0 {
-                            // Pre-allocate output tensors and fill with slice_set
-                            let (ref first_k, ref first_v) = parts[0];
-                            let mut k_shape = first_k.dims().to_vec();
-                            k_shape[2] = total_len;
-                            let mut v_shape = first_v.dims().to_vec();
-                            v_shape[2] = total_len;
+                            // Concatenate block parts along the sequence dimension.
+                            let k_parts: Vec<&candle_core::Tensor> =
+                                parts.iter().map(|(k, _)| k).collect();
+                            let v_parts: Vec<&candle_core::Tensor> =
+                                parts.iter().map(|(_, v)| v).collect();
 
-                            let assembled_k = candle_core::Tensor::zeros(
-                                k_shape, first_k.dtype(), first_k.device(),
-                            );
-                            let assembled_v = candle_core::Tensor::zeros(
-                                v_shape, first_v.dtype(), first_v.device(),
-                            );
-
-                            if let (Ok(k_out), Ok(v_out)) = (assembled_k, assembled_v) {
-                                let mut offset = 0usize;
-                                let mut ok = true;
-                                for (k_part, v_part) in &parts {
-                                    if k_out.slice_set(k_part, 2, offset).is_err()
-                                        || v_out.slice_set(v_part, 2, offset).is_err()
-                                    {
-                                        ok = false;
-                                        break;
-                                    }
-                                    offset += k_part.dim(2).unwrap_or(0);
-                                }
-                                if ok {
-                                    composite_cache[layer_idx] =
-                                        Some(crate::pipeline::KvCache::Normal {
-                                            k: crate::kv_cache::SingleCache {
-                                                all_data: Some(k_out),
-                                                dim: 2,
-                                                current_seq_len: total_len,
-                                                max_seq_len: usize::MAX,
-                                                capacity_seq_len: total_len,
-                                            },
-                                            v: crate::kv_cache::SingleCache {
-                                                all_data: Some(v_out),
-                                                dim: 2,
-                                                current_seq_len: total_len,
-                                                max_seq_len: usize::MAX,
-                                                capacity_seq_len: total_len,
-                                            },
-                                        });
-                                }
+                            if let (Ok(k_out), Ok(v_out)) = (
+                                candle_core::Tensor::cat(&k_parts, 2),
+                                candle_core::Tensor::cat(&v_parts, 2),
+                            ) {
+                                composite_cache[layer_idx] =
+                                    Some(crate::pipeline::KvCache::Normal {
+                                        k: crate::kv_cache::SingleCache {
+                                            all_data: Some(k_out),
+                                            dim: 2,
+                                            current_seq_len: total_len,
+                                            max_seq_len: usize::MAX,
+                                            capacity_seq_len: total_len,
+                                        },
+                                        v: crate::kv_cache::SingleCache {
+                                            all_data: Some(v_out),
+                                            dim: 2,
+                                            current_seq_len: total_len,
+                                            max_seq_len: usize::MAX,
+                                            capacity_seq_len: total_len,
+                                        },
+                                    });
                             }
                         }
                     }

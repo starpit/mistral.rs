@@ -107,6 +107,7 @@ pub fn pic_sdpa_attention(
         )
     } else {
         // Initial PIC / cache-reuse: append raw K and RoPE the full cache
+        let is_cache_reuse = pic_ctx.cross_full_positions.is_some();
         let (k_all, v_all) = kv_cache.append(k, v)?;
 
         let past_kv_len = k_all.dim(2)? - seq_len;
@@ -116,14 +117,34 @@ pub fn pic_sdpa_attention(
         let (q_roped, k_roped) =
             rope.pic_forward_per_token(q, &k_all, &q_positions, &k_positions)?;
 
-        Sdpa.run_attention(
-            &q_roped,
-            &k_roped,
-            &v_all,
-            attention_mask,
-            Some(flash_params),
-            sdpa_params,
-        )
+        // Work around Metal SDPA kernel NaN bug: the Metal kernel produces
+        // NaN outputs for non-square masks with GQA (different Q/K head counts).
+        // This happens in the cache-reuse path where tgt_len < kv_len.
+        // Force the naive SDPA path by doing GQA expansion + manual matmul.
+        let attn_out = if is_cache_reuse && past_kv_len > 0 && q_roped.device().is_metal() {
+            use crate::layers_utils::repeat_kv;
+            let k_expanded = repeat_kv(k_roped.clone(), sdpa_params.n_kv_groups)?;
+            let v_expanded = repeat_kv(v_all.clone(), sdpa_params.n_kv_groups)?;
+            let scale = (q_roped.dim(candle_core::D::Minus1)? as f64).sqrt();
+            let att = (q_roped.matmul(&k_expanded.transpose(2, 3)?)? / scale)?;
+            let att = match attention_mask {
+                Some(m) => att.broadcast_add(m)?,
+                None => att,
+            };
+            let att = candle_nn::ops::softmax_last_dim(&att)?;
+            att.matmul(&v_expanded)?
+        } else {
+            Sdpa.run_attention(
+                &q_roped,
+                &k_roped,
+                &v_all,
+                attention_mask,
+                Some(flash_params),
+                sdpa_params,
+            )?
+        };
+
+        Ok(attn_out)
     }
 }
 
@@ -259,16 +280,26 @@ impl PicContext {
             (&self.cross_full_positions, &self.cached_kv_full_positions)
         {
             let cached_len = cached_kv_pos.len();
+            let cross_len = cross_pos.len();
             let mask_data: Vec<f32> = (0..tgt_len)
                 .flat_map(|i| {
-                    let q_full_pos = cross_pos[i];
+                    // Q position: cross_pos for prefill tokens, total_len+offset for decode tokens
+                    let q_full_pos = if i < cross_len {
+                        cross_pos[i]
+                    } else {
+                        self.total_len + (i - cross_len)
+                    };
                     (0..full_len).map(move |j| {
+                        // K position: cached Plus KV, then cross KV, then decode KV
                         let k_full_pos = if j < cached_len {
-                            // Pre-loaded Plus block KV entry
                             cached_kv_pos[j]
                         } else {
-                            // Cross KV entry (mirrors Q ordering)
-                            cross_pos[j - cached_len]
+                            let ci = j - cached_len;
+                            if ci < cross_len {
+                                cross_pos[ci]
+                            } else {
+                                self.total_len + (ci - cross_len)
+                            }
                         };
                         if k_full_pos <= q_full_pos {
                             0.0f32

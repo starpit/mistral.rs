@@ -56,6 +56,7 @@ async fn process_chunk(runner: &MistralRs, chunk: Vec<u32>) -> anyhow::Result<(T
         web_search_options: None,
         model_id: None,
         truncate_sequence: false,
+        pic_context: None,
     }));
 
     runner.get_sender(None)?.send(request).await?;
