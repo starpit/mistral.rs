@@ -106,7 +106,7 @@ pub fn pic_sdpa_attention(
             sdpa_params,
         )
     } else {
-        // Initial PIC: append raw K and RoPE the full cache
+        // Initial PIC / cache-reuse: append raw K and RoPE the full cache
         let (k_all, v_all) = kv_cache.append(k, v)?;
 
         let past_kv_len = k_all.dim(2)? - seq_len;
@@ -184,6 +184,12 @@ pub struct PicContext {
     /// (positions 0..block_len). The forward pass should only apply RoPE to
     /// new (non-cached) tokens, not the entire cache.
     pub has_pre_roped_k: bool,
+    /// For cache reuse: full-sequence position of each Cross Q token.
+    /// When set, `make_pic_mask` and `compute_pic_rope_positions` use
+    /// position-based logic instead of block-type lookups.
+    pub cross_full_positions: Option<Vec<usize>>,
+    /// For cache reuse: full-sequence position of each pre-loaded KV entry.
+    pub cached_kv_full_positions: Option<Vec<usize>>,
 }
 
 impl PicContext {
@@ -209,6 +215,8 @@ impl PicContext {
             position_ids,
             total_len,
             has_pre_roped_k: false,
+            cross_full_positions: None,
+            cached_kv_full_positions: None,
         }
     }
 
@@ -245,13 +253,41 @@ impl PicContext {
     ) -> Result<Tensor> {
         let full_len = tgt_len + past_kv_len;
 
-        // For the initial implementation, tgt_len should equal total_len
-        // (we're processing the full prompt in one shot for the PoC)
+        // Cache-reuse path: all Q tokens are Cross, KV layout is
+        // [cached_Plus_KV | Cross_KV]. Use position-based causal masking.
+        if let (Some(cross_pos), Some(cached_kv_pos)) =
+            (&self.cross_full_positions, &self.cached_kv_full_positions)
+        {
+            let cached_len = cached_kv_pos.len();
+            let mask_data: Vec<f32> = (0..tgt_len)
+                .flat_map(|i| {
+                    let q_full_pos = cross_pos[i];
+                    (0..full_len).map(move |j| {
+                        let k_full_pos = if j < cached_len {
+                            // Pre-loaded Plus block KV entry
+                            cached_kv_pos[j]
+                        } else {
+                            // Cross KV entry (mirrors Q ordering)
+                            cross_pos[j - cached_len]
+                        };
+                        if k_full_pos <= q_full_pos {
+                            0.0f32
+                        } else {
+                            f32::NEG_INFINITY
+                        }
+                    })
+                })
+                .collect();
+
+            let mask = Tensor::from_vec(mask_data, (tgt_len, full_len), device)?;
+            return mask.to_dtype(dtype);
+        }
+
+        // Standard PIC path: block-type based masking
         let mask_data: Vec<f32> = (0..tgt_len)
             .flat_map(|i| {
                 let q_idx = past_kv_len + i;
                 (0..full_len).map(move |j| {
-                    // Default: don't attend
                     let q_is_plus = self.is_plus_token(q_idx);
                     let k_is_plus = self.is_plus_token(j);
 
@@ -362,6 +398,37 @@ pub fn compute_pic_rope_positions(
     seq_len: usize,
     past_kv_len: usize,
 ) -> (Vec<usize>, Vec<usize>) {
+    // Cache-reuse path: KV layout is [cached_Plus(cached_len) | Cross(cross_len) | decode...]
+    // Map each index to its full-sequence position.
+    if let (Some(cross_pos), Some(cached_kv_pos)) =
+        (&pic_ctx.cross_full_positions, &pic_ctx.cached_kv_full_positions)
+    {
+        let cached_len = cached_kv_pos.len();
+        let cross_len = cross_pos.len();
+
+        let position_for_kv_index = |i: usize| -> usize {
+            if i < cached_len {
+                cached_kv_pos[i]
+            } else if i < cached_len + cross_len {
+                cross_pos[i - cached_len]
+            } else {
+                // Decode tokens beyond the prefill sequence
+                pic_ctx.total_len + (i - cached_len - cross_len)
+            }
+        };
+
+        let total_kv_len = past_kv_len + seq_len;
+        let q_positions: Vec<usize> = (past_kv_len..total_kv_len)
+            .map(position_for_kv_index)
+            .collect();
+        let k_positions: Vec<usize> = (0..total_kv_len)
+            .map(position_for_kv_index)
+            .collect();
+
+        return (q_positions, k_positions);
+    }
+
+    // Standard PIC path
     let total_kv_len = past_kv_len + seq_len;
 
     let q_positions: Vec<usize> = (past_kv_len..total_kv_len)
@@ -1568,5 +1635,424 @@ mod tests {
         // This documents the contract: both prefill paths must set token_offset
         // when cache data is pre-loaded.
         let _ = (pic_ctx, remaining_toks); // used by prefill_v2_pic in production
+    }
+
+    // -----------------------------------------------------------------------
+    // Cache-reuse path: make_pic_mask with position mappings
+    // -----------------------------------------------------------------------
+
+    /// Build a PicContext with reuse fields set (simulating the cache-hit path).
+    fn reuse_ctx(
+        blocks: Vec<PicBlock>,
+        cross_positions: Vec<usize>,
+        cached_kv_positions: Vec<usize>,
+    ) -> PicContext {
+        let mut ctx = PicContext::new(blocks);
+        ctx.cross_full_positions = Some(cross_positions);
+        ctx.cached_kv_full_positions = Some(cached_kv_positions);
+        ctx
+    }
+
+    #[test]
+    fn test_reuse_mask_basic() {
+        // Full sequence: Cross(0..3) Plus(3..6) Cross(6..8)
+        // Cached KV: Plus tokens at full-sequence positions [3,4,5]
+        // Q tokens (Cross only): full-sequence positions [0,1,2,6,7]
+        // KV layout: [Plus(3,4,5) | Cross(0,1,2,6,7)]
+        let ctx = reuse_ctx(
+            vec![cross(0, 3), plus(3, 3), cross(6, 2)],
+            vec![0, 1, 2, 6, 7],       // cross_full_positions
+            vec![3, 4, 5],              // cached_kv_full_positions
+        );
+
+        let tgt_len = 5;   // 5 Cross Q tokens
+        let past_kv_len = 3; // 3 cached Plus KV entries
+        let mask = ctx
+            .make_pic_mask(tgt_len, past_kv_len, &Device::Cpu, DType::F32)
+            .unwrap();
+        let vals = mask_to_vec(&mask);
+        let full_len = tgt_len + past_kv_len; // 8
+        let at = |q: usize, k: usize| vals[q * full_len + k];
+
+        // Q0 (pos=0): should NOT attend to Plus tokens (pos 3,4,5 > 0)
+        assert!(blocked(at(0, 0))); // Plus pos=3 > Q pos=0
+        assert!(blocked(at(0, 1))); // Plus pos=4 > Q pos=0
+        assert!(blocked(at(0, 2))); // Plus pos=5 > Q pos=0
+        // Q0 (pos=0): should attend to Cross pos=0 (itself)
+        assert!(attends(at(0, 3))); // Cross pos=0 <= Q pos=0
+        // Q0: should NOT attend to Cross pos=1,2,6,7
+        assert!(blocked(at(0, 4))); // Cross pos=1 > Q pos=0
+        assert!(blocked(at(0, 5))); // Cross pos=2 > Q pos=0
+
+        // Q2 (pos=2): should NOT attend to Plus pos=3,4,5
+        assert!(blocked(at(2, 0)));
+        // Q2: should attend to Cross pos=0,1,2
+        assert!(attends(at(2, 3))); // Cross pos=0
+        assert!(attends(at(2, 4))); // Cross pos=1
+        assert!(attends(at(2, 5))); // Cross pos=2
+
+        // Q3 (pos=6): should attend to Plus pos=3,4,5 (all <= 6)
+        assert!(attends(at(3, 0))); // Plus pos=3
+        assert!(attends(at(3, 1))); // Plus pos=4
+        assert!(attends(at(3, 2))); // Plus pos=5
+        // Q3 (pos=6): should attend to Cross pos=0,1,2,6
+        assert!(attends(at(3, 3))); // Cross pos=0
+        assert!(attends(at(3, 4))); // Cross pos=1
+        assert!(attends(at(3, 5))); // Cross pos=2
+        assert!(attends(at(3, 6))); // Cross pos=6 (itself)
+        // Q3 (pos=6): should NOT attend to Cross pos=7
+        assert!(blocked(at(3, 7))); // Cross pos=7 > Q pos=6
+
+        // Q4 (pos=7): should attend to everything
+        assert!(attends(at(4, 0))); // Plus pos=3
+        assert!(attends(at(4, 7))); // Cross pos=7 (itself)
+    }
+
+    #[test]
+    fn test_reuse_mask_shape() {
+        let ctx = reuse_ctx(
+            vec![cross(0, 2), plus(2, 3), cross(5, 1)],
+            vec![0, 1, 5],
+            vec![2, 3, 4],
+        );
+        let mask = ctx
+            .make_pic_mask(3, 3, &Device::Cpu, DType::F32)
+            .unwrap();
+        assert_eq!(mask.dims(), &[3, 6]);
+    }
+
+    #[test]
+    fn test_reuse_mask_multiple_plus_blocks() {
+        // Full seq: Cross(0..2) PlusA(2..5) Cross(5..6) PlusB(6..9) Cross(9..11)
+        // Cached KV: PlusA(2,3,4) + PlusB(6,7,8) = positions [2,3,4,6,7,8]
+        // Cross Q: positions [0,1,5,9,10]
+        let ctx = reuse_ctx(
+            vec![cross(0, 2), plus(2, 3), cross(5, 1), plus(6, 3), cross(9, 2)],
+            vec![0, 1, 5, 9, 10],
+            vec![2, 3, 4, 6, 7, 8],
+        );
+
+        let tgt_len = 5;
+        let past_kv_len = 6;
+        let mask = ctx
+            .make_pic_mask(tgt_len, past_kv_len, &Device::Cpu, DType::F32)
+            .unwrap();
+        let vals = mask_to_vec(&mask);
+        let full_len = tgt_len + past_kv_len;
+        let at = |q: usize, k: usize| vals[q * full_len + k];
+
+        // Q0 (pos=0): only attends to itself (Cross pos=0)
+        assert!(blocked(at(0, 0))); // PlusA pos=2
+        assert!(attends(at(0, 6))); // Cross pos=0
+
+        // Q2 (pos=5): attends to PlusA(2,3,4) and Cross(0,1,5), but not PlusB(6,7,8)
+        assert!(attends(at(2, 0))); // PlusA pos=2
+        assert!(attends(at(2, 1))); // PlusA pos=3
+        assert!(attends(at(2, 2))); // PlusA pos=4
+        assert!(blocked(at(2, 3))); // PlusB pos=6 > 5
+        assert!(attends(at(2, 6))); // Cross pos=0
+        assert!(attends(at(2, 7))); // Cross pos=1
+        assert!(attends(at(2, 8))); // Cross pos=5 (itself)
+
+        // Q4 (pos=10): attends to everything
+        for k in 0..full_len {
+            assert!(attends(at(4, k)), "Q4 should attend to K{k}");
+        }
+    }
+
+    #[test]
+    fn test_reuse_mask_with_sentinel_gaps() {
+        // Simulates real token layout with sentinel tokens between blocks.
+        // Full token sequence: [CROSS_SENT, a, b, PLUS_SENT, c, d, e, CROSS_SENT, f]
+        // Indices:                0          1  2    3         4  5  6    7          8
+        // Blocks from detect_pic_blocks:
+        //   Cross(start=1, len=2)   → indices 1,2
+        //   Plus(start=4, len=3)    → indices 4,5,6
+        //   Cross(start=8, len=1)   → index 8
+        //
+        // remaining_toks (non-Plus): indices [0, 1, 2, 3, 7, 8] (sentinels + cross blocks)
+        // cross_full_positions must match: [0, 1, 2, 3, 7, 8]
+        // cached_kv_full_positions: [4, 5, 6]
+        let ctx = reuse_ctx(
+            vec![cross(1, 2), plus(4, 3), cross(8, 1)],
+            vec![0, 1, 2, 3, 7, 8],   // includes sentinel positions 0, 3, 7
+            vec![4, 5, 6],
+        );
+
+        let tgt_len = 6;     // 6 non-Plus tokens
+        let past_kv_len = 3; // 3 cached Plus KV entries
+        let mask = ctx
+            .make_pic_mask(tgt_len, past_kv_len, &Device::Cpu, DType::F32)
+            .unwrap();
+        let vals = mask_to_vec(&mask);
+        let full_len = tgt_len + past_kv_len; // 9
+        let at = |q: usize, k: usize| vals[q * full_len + k];
+
+        // Q0 (pos=0): sentinel at position 0, shouldn't attend to Plus(4,5,6)
+        assert!(blocked(at(0, 0))); // Plus pos=4 > 0
+        assert!(blocked(at(0, 1))); // Plus pos=5 > 0
+        assert!(blocked(at(0, 2))); // Plus pos=6 > 0
+        assert!(attends(at(0, 3))); // Cross pos=0 (itself)
+        assert!(blocked(at(0, 4))); // Cross pos=1 > 0
+
+        // Q3 (pos=3): sentinel at position 3, attends to Cross(0,1,2,3) but not Plus(4,5,6)
+        assert!(blocked(at(3, 0))); // Plus pos=4 > 3
+        assert!(attends(at(3, 3))); // Cross pos=0
+        assert!(attends(at(3, 4))); // Cross pos=1
+        assert!(attends(at(3, 5))); // Cross pos=2
+        assert!(attends(at(3, 6))); // Cross pos=3 (itself)
+        assert!(blocked(at(3, 7))); // Cross pos=7 > 3
+
+        // Q5 (pos=8): last token, attends to everything
+        for k in 0..full_len {
+            assert!(attends(at(5, k)), "Q5 (pos=8) should attend to K{k}");
+        }
+    }
+
+    #[test]
+    fn test_reuse_positions_with_sentinel_gaps() {
+        // Same layout as test_reuse_mask_with_sentinel_gaps
+        let ctx = reuse_ctx(
+            vec![cross(1, 2), plus(4, 3), cross(8, 1)],
+            vec![0, 1, 2, 3, 7, 8],
+            vec![4, 5, 6],
+        );
+
+        // Prefill: past_kv_len=3 (Plus), seq_len=6 (non-Plus tokens)
+        let (q_pos, k_pos) = compute_pic_rope_positions(&ctx, 6, 3);
+
+        assert_eq!(q_pos, vec![0, 1, 2, 3, 7, 8]);
+        assert_eq!(k_pos, vec![4, 5, 6, 0, 1, 2, 3, 7, 8]);
+    }
+
+    #[test]
+    fn test_reuse_cross_positions_len_must_equal_tgt_len() {
+        // Regression: if cross_full_positions.len() != tgt_len, make_pic_mask panics.
+        // This test ensures that when blocks have gaps (sentinels), the caller
+        // must include those gap positions in cross_full_positions.
+        //
+        // Token layout: [SENT, a, SENT, b, c]  (sentinels at 0, 2)
+        // Blocks: Cross(1,1), Plus(3,2)  → only covers indices 1, 3, 4
+        // Non-Plus tokens: indices [0, 1, 2]
+        let ctx = reuse_ctx(
+            vec![cross(1, 1), plus(3, 2)],
+            vec![0, 1, 2],  // sentinel(0), cross(1), sentinel(2)
+            vec![3, 4],
+        );
+
+        // Should NOT panic: tgt_len=3, cross_positions.len()=3
+        let mask = ctx.make_pic_mask(3, 2, &Device::Cpu, DType::F32);
+        assert!(mask.is_ok());
+    }
+
+    #[test]
+    fn test_reuse_sdpa_with_sentinel_gaps() {
+        // End-to-end test simulating sentinel tokens in the reuse path
+        let rope = test_rope();
+        let flash = cpu_flash_params();
+        let sdpa = test_sdpa_params();
+
+        // Blocks: Cross(1,2) Plus(4,3) Cross(8,1)
+        // Sentinels at positions 0, 3, 7
+        // non-Plus count = 6 (positions 0,1,2,3,7,8)
+        // Plus count = 3 (positions 4,5,6)
+        let non_plus_len = 6;
+        let plus_len = 3;
+
+        let k_plus = make_rand_tensor(plus_len, 42);
+        let v_plus = make_rand_tensor(plus_len, 43);
+        let mut cache = make_kv_cache();
+        let _ = cache.append(&k_plus, &v_plus).unwrap();
+
+        let q = make_rand_tensor(non_plus_len, 1);
+        let k = make_rand_tensor(non_plus_len, 2);
+        let v = make_rand_tensor(non_plus_len, 3);
+
+        let ctx = reuse_ctx(
+            vec![cross(1, 2), plus(4, 3), cross(8, 1)],
+            vec![0, 1, 2, 3, 7, 8],
+            vec![4, 5, 6],
+        );
+
+        let mask = ctx
+            .make_pic_mask(non_plus_len, plus_len, &Device::Cpu, DType::F32)
+            .unwrap();
+
+        let out = pic_sdpa_attention(
+            &q, &k, &v, &ctx, &rope, &mut cache, Some(&mask), &flash, &sdpa,
+        )
+        .unwrap();
+
+        assert_eq!(out.dims(), &[1, NUM_HEADS, non_plus_len, HEAD_DIM]);
+        assert_eq!(cache.current_seq_len(), plus_len + non_plus_len);
+        let vals: Vec<f32> = out.flatten_all().unwrap().to_vec1().unwrap();
+        assert!(
+            vals.iter().all(|v| v.is_finite()),
+            "Reuse with sentinels must produce finite output"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Cache-reuse path: compute_pic_rope_positions with position mappings
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_reuse_rope_positions_prefill() {
+        // Full seq: Cross(0..3) Plus(3..6) Cross(6..8)
+        // Cached KV: [3,4,5], Cross Q: [0,1,2,6,7]
+        // KV layout at prefill: [Plus(3) | Cross(5)] = past_kv_len=3, seq_len=5
+        let ctx = reuse_ctx(
+            vec![cross(0, 3), plus(3, 3), cross(6, 2)],
+            vec![0, 1, 2, 6, 7],
+            vec![3, 4, 5],
+        );
+
+        let (q_pos, k_pos) = compute_pic_rope_positions(&ctx, 5, 3);
+
+        // Q positions: kv indices 3..8 → Cross positions [0,1,2,6,7]
+        assert_eq!(q_pos, vec![0, 1, 2, 6, 7]);
+        // K positions: kv indices 0..8 → [Plus(3,4,5), Cross(0,1,2,6,7)]
+        assert_eq!(k_pos, vec![3, 4, 5, 0, 1, 2, 6, 7]);
+    }
+
+    #[test]
+    fn test_reuse_rope_positions_decode() {
+        // After prefill: cache has [Plus(3) | Cross(5)] = 8 entries
+        // Decode 1 new token: past_kv_len=8, seq_len=1
+        let ctx = reuse_ctx(
+            vec![cross(0, 3), plus(3, 3), cross(6, 2)],
+            vec![0, 1, 2, 6, 7],
+            vec![3, 4, 5],
+        );
+
+        let (q_pos, k_pos) = compute_pic_rope_positions(&ctx, 1, 8);
+
+        // Q: kv index 8 → beyond cached(3)+cross(5)=8, so decode: total_len + (8-3-5) = 8+0 = 8
+        assert_eq!(q_pos, vec![8]);
+        // K: indices 0..9 → [Plus(3,4,5), Cross(0,1,2,6,7), decode(8)]
+        assert_eq!(k_pos, vec![3, 4, 5, 0, 1, 2, 6, 7, 8]);
+    }
+
+    #[test]
+    fn test_reuse_rope_positions_second_decode() {
+        // After first decode: cache has 9 entries, decode another
+        let ctx = reuse_ctx(
+            vec![cross(0, 3), plus(3, 3), cross(6, 2)],
+            vec![0, 1, 2, 6, 7],
+            vec![3, 4, 5],
+        );
+
+        let (q_pos, k_pos) = compute_pic_rope_positions(&ctx, 1, 9);
+
+        // Q: kv index 9 → total_len + (9-3-5) = 8+1 = 9
+        assert_eq!(q_pos, vec![9]);
+        // K: indices 0..10
+        assert_eq!(k_pos, vec![3, 4, 5, 0, 1, 2, 6, 7, 8, 9]);
+    }
+
+    // -----------------------------------------------------------------------
+    // Cache-reuse path: pic_sdpa_attention end-to-end
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_reuse_sdpa_output_shape_and_finite() {
+        let rope = test_rope();
+        let flash = cpu_flash_params();
+        let sdpa = test_sdpa_params();
+
+        // Full seq: Cross(3) Plus(3) Cross(2) = 8 tokens
+        // Simulate reuse: pre-load Plus KV into cache, then send Cross Q
+        let cross_len = 5; // 3 + 2 cross tokens
+        let plus_len = 3;
+
+        // Pre-load Plus block raw K/V into cache
+        let k_plus = make_rand_tensor(plus_len, 42);
+        let v_plus = make_rand_tensor(plus_len, 43);
+        let mut cache = make_kv_cache();
+        let _ = cache.append(&k_plus, &v_plus).unwrap();
+        assert_eq!(cache.current_seq_len(), plus_len);
+
+        // Cross Q/K/V
+        let q = make_rand_tensor(cross_len, 1);
+        let k = make_rand_tensor(cross_len, 2);
+        let v = make_rand_tensor(cross_len, 3);
+
+        let ctx = reuse_ctx(
+            vec![cross(0, 3), plus(3, 3), cross(6, 2)],
+            vec![0, 1, 2, 6, 7],
+            vec![3, 4, 5],
+        );
+
+        let mask = ctx
+            .make_pic_mask(cross_len, plus_len, &Device::Cpu, DType::F32)
+            .unwrap();
+
+        let out = pic_sdpa_attention(
+            &q, &k, &v, &ctx, &rope, &mut cache, Some(&mask), &flash, &sdpa,
+        )
+        .unwrap();
+
+        assert_eq!(out.dims(), &[1, NUM_HEADS, cross_len, HEAD_DIM]);
+        assert_eq!(cache.current_seq_len(), plus_len + cross_len);
+        let vals: Vec<f32> = out.flatten_all().unwrap().to_vec1().unwrap();
+        assert!(
+            vals.iter().all(|v| v.is_finite()),
+            "Reuse path output must be finite"
+        );
+    }
+
+    #[test]
+    fn test_reuse_sdpa_then_decode() {
+        let rope = test_rope();
+        let flash = cpu_flash_params();
+        let sdpa = test_sdpa_params();
+
+        let cross_len = 5;
+        let plus_len = 3;
+
+        // Pre-load Plus block raw K/V
+        let k_plus = make_rand_tensor(plus_len, 42);
+        let v_plus = make_rand_tensor(plus_len, 43);
+        let mut cache = make_kv_cache();
+        let _ = cache.append(&k_plus, &v_plus).unwrap();
+
+        // Cross prefill
+        let q = make_rand_tensor(cross_len, 1);
+        let k = make_rand_tensor(cross_len, 2);
+        let v = make_rand_tensor(cross_len, 3);
+
+        let ctx = reuse_ctx(
+            vec![cross(0, 3), plus(3, 3), cross(6, 2)],
+            vec![0, 1, 2, 6, 7],
+            vec![3, 4, 5],
+        );
+
+        let mask = ctx
+            .make_pic_mask(cross_len, plus_len, &Device::Cpu, DType::F32)
+            .unwrap();
+
+        let _ = pic_sdpa_attention(
+            &q, &k, &v, &ctx, &rope, &mut cache, Some(&mask), &flash, &sdpa,
+        )
+        .unwrap();
+        assert_eq!(cache.current_seq_len(), 8);
+
+        // Decode step
+        let q_dec = make_rand_tensor(1, 10);
+        let k_dec = make_rand_tensor(1, 11);
+        let v_dec = make_rand_tensor(1, 12);
+
+        let out_dec = pic_sdpa_attention(
+            &q_dec, &k_dec, &v_dec, &ctx, &rope, &mut cache, None, &flash, &sdpa,
+        )
+        .unwrap();
+
+        assert_eq!(out_dec.dims(), &[1, NUM_HEADS, 1, HEAD_DIM]);
+        assert_eq!(cache.current_seq_len(), 9);
+        let vals: Vec<f32> = out_dec.flatten_all().unwrap().to_vec1().unwrap();
+        assert!(
+            vals.iter().all(|v| v.is_finite()),
+            "Decode after reuse must be finite"
+        );
     }
 }

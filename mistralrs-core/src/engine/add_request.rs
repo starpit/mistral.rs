@@ -863,6 +863,10 @@ impl Engine {
                                     } else {
                                         raw_k
                                     };
+                                    // Make contiguous: cached blocks are narrow() views
+                                    // and slice_set requires contiguous tensors.
+                                    let k = k.contiguous().unwrap_or(k);
+                                    let v = v.contiguous().unwrap_or(v);
                                     total_len += k.dim(2).unwrap_or(0);
                                     parts.push((k, v));
                                 }
@@ -919,15 +923,29 @@ impl Engine {
                         }
                     }
 
+                    // Compute full-sequence positions for cached Plus block KV entries
+                    let cached_kv_positions: Vec<usize> = block_caches
+                        .iter()
+                        .flat_map(|(block, _)| block.start..block.start + block.len)
+                        .collect();
+
                     let mut pic_ctx = pic::PicContext::new(pic_blocks);
                     pic_ctx.has_pre_roped_k = all_have_roped_k;
-                    let remaining_toks: Vec<u32> = seq
-                        .get_toks()
-                        .iter()
-                        .enumerate()
-                        .filter(|(idx, _)| !pic_ctx.is_plus_token(*idx))
-                        .map(|(_, &t)| t)
-                        .collect();
+
+                    // Compute full-sequence positions for non-Plus tokens
+                    // (Cross blocks + sentinel tokens + gap tokens). Must use the
+                    // same filter as remaining_toks so lengths match exactly.
+                    let mut cross_positions: Vec<usize> = Vec::new();
+                    let mut remaining_toks: Vec<u32> = Vec::new();
+                    for (idx, &tok) in seq.get_toks().iter().enumerate() {
+                        if !pic_ctx.is_plus_token(idx) {
+                            cross_positions.push(idx);
+                            remaining_toks.push(tok);
+                        }
+                    }
+
+                    pic_ctx.cross_full_positions = Some(cross_positions);
+                    pic_ctx.cached_kv_full_positions = Some(cached_kv_positions);
 
                     self.logger.add_prefix_cache_hit();
                     seq.prefill_v2_pic(composite_cache, pic_ctx, remaining_toks)
